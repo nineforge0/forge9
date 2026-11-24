@@ -1,4 +1,5 @@
-//! Mod packs: a TOML manifest of entry replacements applied through repack.
+//! Mod packs: a TOML manifest of entry patches applied through repack.
 
 pub mod apply;
 pub mod manifest;
+pub mod patch;

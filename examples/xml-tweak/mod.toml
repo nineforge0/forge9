@@ -1,0 +1,15 @@
+[mod]
+name = "xml-tweak"
+version = "0.1.0"
+description = "Raises one navigation value in a vehicle points definition"
+target_archive = "common.rpf"
+
+[[patch]]
+path = "9"
+base_sha256 = "951e1174c3b64db0e0f40c02f4e6e1f9a3313580a510ac11bd5701d07033e789"
+
+[[patch.op]]
+type = "xml"
+path = "CVehiclePoints/fNavMaxHeightChange"
+attr = "value"
+value = "0.400000"

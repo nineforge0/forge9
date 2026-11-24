@@ -279,14 +279,14 @@ enum ModCommand {
         #[arg(default_value = "mod.toml")]
         path: PathBuf,
     },
-    /// Check that replacement files exist and fit the target archive
+    /// Check every guard and patch precondition against the archive, without writing
     Verify {
         manifest: PathBuf,
         /// Archive to check against (default: the manifest's target_archive)
         #[arg(long)]
         archive: Option<PathBuf>,
     },
-    /// Apply the manifest's replacements, writing a repacked archive
+    /// Apply the manifest's patches, writing a repacked archive
     Apply {
         manifest: PathBuf,
         #[arg(short, long, default_value = "modded.rpf")]
@@ -294,6 +294,14 @@ enum ModCommand {
         /// Archive to patch (default: the manifest's target_archive)
         #[arg(long)]
         archive: Option<PathBuf>,
+    },
+    /// Print a [[patch]] table that turns an extracted payload into an edited copy of it
+    Make {
+        /// Entry path the payload was extracted from, as `list --recursive` prints it
+        #[arg(long)]
+        path: String,
+        original: PathBuf,
+        edited: PathBuf,
     },
 }
 
@@ -317,7 +325,21 @@ fn main() -> Result<()> {
         let crypto = rpf9::crypto::CryptoContext::load(&cli.data_dir).ok();
         let problems = modding::apply::verify(&m, archive.as_deref(), crypto.as_ref())?;
         if problems > 0 { anyhow::bail!("{problems} problem(s) found"); }
-        println!("ok: {} replacement(s)", m.replace.len());
+        println!("ok: {} patch(es)", m.patch.len());
+        return Ok(());
+    }
+    if let Command::Mod(ModCommand::Make { path, original, edited }) = &cli.command {
+        let old = std::fs::read(original).with_context(|| format!("reading {}", original.display()))?;
+        let new = std::fs::read(edited).with_context(|| format!("reading {}", edited.display()))?;
+        let ops = modding::patch::make(&old, &new)?;
+        let carried: usize = ops.iter().map(|op| match op {
+            modding::manifest::Op::Text { find, .. } => find.len(),
+            modding::manifest::Op::Xml { expect, .. } => expect.as_ref().map_or(0, String::len),
+            modding::manifest::Op::Bytes { expect, .. } => expect.len() / 2,
+        }).sum();
+        eprintln!("{} op(s) carrying {carried} of the original's {} bytes", ops.len(), old.len());
+        let p = modding::manifest::Patch { path: path.clone(), base_sha256: Some(modding::patch::sha256_hex(&old)), file: None, ops };
+        print!("{}", toml::to_string(&std::collections::BTreeMap::from([("patch", [p])]))?);
         return Ok(());
     }
     if let Command::Texture { store, extract, decode, output, slice } = &cli.command {

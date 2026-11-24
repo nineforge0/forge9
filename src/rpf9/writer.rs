@@ -56,10 +56,6 @@ pub fn replace_zlib_inplace(
     new_data: &[u8],
     output: &Path,
 ) -> Result<()> {
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
     let archive = Archive::open(original, crypto)?;
     let entry = archive.entries().get(entry_index)
         .ok_or_else(|| anyhow::anyhow!("entry index {entry_index} out of range"))?;
@@ -71,17 +67,7 @@ pub fn replace_zlib_inplace(
     let start = entry.offset as usize;
     let old_size = entry.size as usize;
 
-    // Compress into 64KB chunks with 16-byte alignment, matching RPF9 layout
-    let mut compressed = Vec::new();
-    for chunk in new_data.chunks(0x10000) {
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-        encoder.write_all(chunk)?;
-        let zchunk = encoder.finish()?;
-        compressed.extend_from_slice(&zchunk);
-        let pad = (16 - (compressed.len() % 16)) % 16;
-        compressed.resize(compressed.len() + pad, 0);
-    }
-
+    let mut compressed = zlib_chain(new_data)?;
     if compressed.len() > old_size {
         bail!(
             "compressed replacement ({} bytes) exceeds original slot ({} bytes). \
@@ -103,15 +89,44 @@ pub fn replace_zlib_inplace(
     Ok(())
 }
 
-/// Full repack: rebuild archive with replaced entries at any size.
-/// Decrypts TOC, lays out payloads, rebuilds entry records,
-/// re-encrypts TOC, writes the new archive.
+/// `data` as a zlib chain matching RPF9 layout: 64KB chunks, each padded to 16 bytes.
+pub fn zlib_chain(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let mut compressed = Vec::new();
+    for chunk in data.chunks(0x10000) {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(chunk)?;
+        compressed.extend_from_slice(&encoder.finish()?);
+        compressed.resize(compressed.len().next_multiple_of(16), 0);
+    }
+    Ok(compressed)
+}
+
+/// Full repack: rebuild archive with replaced entries at any size and write it to `output`.
 pub fn repack(
     original: &[u8],
     crypto: &CryptoContext,
     replacements: &HashMap<usize, Vec<u8>>,
     output: &Path,
 ) -> Result<()> {
+    let out = repack_bytes(original, crypto, replacements)?;
+    std::fs::write(output, &out).context("writing repacked archive")?;
+    println!(
+        "repacked {} entries ({} replaced) → {} ({} bytes)",
+        Archive::open(original, crypto)?.entries().len(), replacements.len(), output.display(), out.len()
+    );
+    Ok(())
+}
+
+/// Decrypts TOC, lays out payloads, rebuilds entry records, re-encrypts TOC.
+pub fn repack_bytes(
+    original: &[u8],
+    crypto: &CryptoContext,
+    replacements: &HashMap<usize, Vec<u8>>,
+) -> Result<Vec<u8>> {
     let archive = Archive::open(original, crypto)?;
     let header = archive.header().clone();
     let key_index = archive.key_index();
@@ -192,11 +207,5 @@ pub fn repack(
     out.extend_from_slice(&toc_cipher);
     out.extend_from_slice(&data_region);
     out.extend_from_slice(trailer);
-
-    std::fs::write(output, &out).context("writing repacked archive")?;
-    println!(
-        "repacked {} entries ({} replaced) → {} ({} bytes)",
-        entries.len(), replacements.len(), output.display(), out.len()
-    );
-    Ok(())
+    Ok(out)
 }
