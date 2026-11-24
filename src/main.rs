@@ -691,11 +691,18 @@ fn cmd_bink(bytes: &[u8]) -> Result<()> {
 }
 
 fn cmd_resource(bytes: &[u8]) -> Result<()> {
+    use formats::drawable;
     let r = formats::resource::parse(bytes)?;
     let magic = r.magic_at.map_or("none".to_string(), |m| format!("0DRP at {m:#x}"));
     let version = r.version.map_or(String::new(), |v| format!(" version {v:#x}"));
     println!("{:?} resource, {} bytes, magic {magic}{version}", r.kind, bytes.len());
     println!("  pointer-like words: {} virtual, {} physical", r.virtual_ptrs, r.physical_ptrs);
+    if let Some((s, g)) = drawable::page_counts(bytes) { println!("  page map: {s} system, {g} graphics pages"); }
+    if let Some(members) = drawable::dictionary(bytes) {
+        println!("  drawable dictionary, {} drawables (export with `model`)", members.len());
+    } else if drawable::looks_like(bytes) {
+        println!("  standalone drawable (export with `model`)");
+    }
     Ok(())
 }
 
@@ -723,6 +730,11 @@ fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, 
     let uv = d.meshes.iter().filter(|m| m.uvs.is_some()).count();
     println!("{} LOD{}: {} meshes ({uv} with UVs), {verts} vertices, {tris} triangles, {} skipped → {}",
         d.name, d.lod, d.meshes.len(), d.skipped.len(), out.display());
+    for m in &d.meshes {
+        let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &m.positions { for k in 0..3 { min[k] = min[k].min(p[k]); max[k] = max[k].max(p[k]); } }
+        println!("  {}: {} vertices, {} triangles, AABB {min:?}..{max:?}", m.name, m.positions.len(), m.indices.len() / 3);
+    }
     Ok(())
 }
 

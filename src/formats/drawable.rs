@@ -1,10 +1,14 @@
 //! Drawables (models): LOD geometry decode and glTF / OBJ export.
 //!
 //! A drawable is a paged resource whose system segment starts with the
-//! drawable header and whose graphics segment holds vertex and index data:
+//! drawable header and whose graphics segment holds vertex and index data.
+//! A drawable dictionary instead starts with `+0x08 page map, +0x18 u32 1,
+//! +0x20 {ptr u32 name hashes, u16 count, u16 capacity}, +0x30 {ptr drawable
+//! pointers, u16 count, u16 capacity}`; its drawables have a zero page map.
+//! Layout checked on real files in docs/drawable_format.md.
 //!
-//! - header: +0x08 page map, +0x10 shader group, +0x18 skeleton, +0x30/+0x40
-//!   bounds, +0x50..+0x68 four LOD group pointers, +0xA8 name
+//! - header: +0x08 page map, +0x10 shader group, +0x18 skeleton, +0x20 center,
+//!   +0x2C radius, +0x30/+0x40 bounds, +0x50..+0x68 four LOD group pointers, +0xA8 name
 //! - LOD group `{ptr models, u16 count, u16 capacity}`; model: +0x08 geometry
 //!   pointers, +0x10 u16 count; geometry: +0x08 vertex buffer, +0x40 index descriptor
 //! - vertex buffer: +0x08 u32 elements, +0x0C u16 stride, +0x18 data, +0x40 layout;
@@ -49,32 +53,69 @@ fn vec3(d: &[u8], at: usize) -> Option<[f32; 3]> {
     Some([f32::from_bits(u32_at(d, at)?), f32::from_bits(u32_at(d, at + 4)?), f32::from_bits(u32_at(d, at + 8)?)])
 }
 
-/// Standalone drawable header check (drawable dictionaries and fragments wrap it differently).
-pub fn looks_like(sys: &[u8]) -> bool {
-    let ptr = |at| u64_at(sys, at).is_some_and(system_ptr);
-    if sys.len() < HEADER || u64_at(sys, 0) != Some(0) || ![8, 16, 80, 168].into_iter().all(ptr) { return false; }
-    let (Some(min), Some(max)) = (vec3(sys, 48), vec3(sys, 64)) else { return false; };
-    let radius = f32::from_bits(u32_at(sys, 44).unwrap());
+/// Drawable header check at system offset `at`. Standalone drawables carry
+/// the page map pointer at +0x08; drawables inside a dictionary have zero there.
+fn header_at(sys: &[u8], at: usize, standalone: bool) -> bool {
+    let ptr = |off| u64_at(sys, at + off).is_some_and(system_ptr);
+    if sys.len() < at + HEADER || u64_at(sys, at) != Some(0) || ![16, 80, 168].into_iter().all(ptr) { return false; }
+    if standalone != ptr(8) || (!standalone && u64_at(sys, at + 8) != Some(0)) { return false; }
+    let (Some(min), Some(max)) = (vec3(sys, at + 48), vec3(sys, at + 64)) else { return false; };
+    let radius = f32::from_bits(u32_at(sys, at + 44).unwrap());
     finite(min) && finite(max) && (0..3).all(|i| min[i] <= max[i]) && (0.0..1e6).contains(&radius)
 }
 
-/// Decodes a drawable from the inflated blocks of its entry: system blocks
-/// first, then graphics. The page map's declared system block count is tried
-/// first, then every other boundary.
+/// Standalone drawable header check.
+pub fn looks_like(sys: &[u8]) -> bool { header_at(sys, 0, true) }
+
+/// System offsets of the drawables of a drawable dictionary, in table order.
+pub fn dictionary(sys: &[u8]) -> Option<Vec<usize>> {
+    let list = |at| -> Option<(usize, usize)> {
+        let (p, n) = (u64_at(sys, at)?, u16_at(sys, at + 8)? as usize);
+        (system_ptr(p) && (1..=4096).contains(&n) && n == u16_at(sys, at + 10)? as usize).then(|| ((p - VIRTUAL_BASE) as usize, n))
+    };
+    if u64_at(sys, 0)? != 0 || !system_ptr(u64_at(sys, 8)?) || u64_at(sys, 16)? != 0 { return None; }
+    let ((hashes, n), (values, m)) = (list(32)?, list(48)?);
+    if n != m || hashes + n * 4 > sys.len() { return None; }
+    (0..n).map(|i| {
+        let p = u64_at(sys, values + i * 8).filter(|&p| system_ptr(p))?;
+        let at = (p - VIRTUAL_BASE) as usize;
+        header_at(sys, at, false).then_some(at)
+    }).collect()
+}
+
+/// System and graphics page counts from the page map that +0x08 points to.
+pub fn page_counts(sys: &[u8]) -> Option<(u8, u8)> {
+    let at = u64_at(sys, 8).filter(|&p| system_ptr(p))? - VIRTUAL_BASE;
+    let c = sys.get(at as usize + 8..at as usize + 10)?;
+    Some((c[0], c[1]))
+}
+
+/// Decodes a drawable, or every drawable of a drawable dictionary (merged,
+/// mesh names prefixed by drawable name), from the inflated blocks of its
+/// entry: system blocks first, then graphics. The page map's declared system
+/// block count is tried first, then every other boundary.
 pub fn parse_blocks(blocks: &[Vec<u8>], lod: usize) -> Result<Drawable> {
     let first = blocks.first().context("empty entry")?;
-    if !looks_like(first) {
-        let what = if first.get(0x10..0x14) == Some(b"0DRP") { " (it is a 0DRP metadata resource)" } else { "" };
-        bail!("not a standalone drawable{what}; drawable dictionaries and fragments are not supported yet");
+    // The page map or dictionary table can sit past the first block.
+    let all = blocks.concat();
+    if !looks_like(first) && dictionary(&all).is_none() {
+        let what = match (first.get(0x10..0x14) == Some(b"0DRP"), page_counts(&all)) {
+            (true, _) => format!(" (0DRP v{:#x} metadata resource)", first.get(0x14).copied().unwrap_or(0)),
+            (false, Some((s, 0))) => format!(" (paged resource with {s} system and no graphics pages)"),
+            _ => String::new(),
+        };
+        bail!("not a drawable or drawable dictionary{what}; fragments are not supported yet");
     }
     ensure!(blocks.len() >= 2, "drawable entry is a single block, so its system/graphics split is unknown");
-    let declared = u64_at(first, 8)
-        .and_then(|p| first.get((p - VIRTUAL_BASE) as usize + 8))
-        .map(|&n| n as usize)
-        .filter(|n| (1..blocks.len()).contains(n));
+    let declared = page_counts(&all).map(|(s, _)| s as usize).filter(|n| (1..blocks.len()).contains(n));
     let mut first_error = None;
     for split in declared.into_iter().chain((1..blocks.len()).filter(|&s| Some(s) != declared)) {
-        match parse(&blocks[..split].concat(), &blocks[split..].concat(), lod) {
+        let (sys, gfx) = (blocks[..split].concat(), blocks[split..].concat());
+        let result = match dictionary(&sys) {
+            Some(members) => parse_dictionary(&sys, &gfx, &members, lod),
+            None => parse(&sys, &gfx, lod),
+        };
+        match result {
             Ok(d) => return Ok(d),
             Err(e) => { first_error.get_or_insert(e); }
         }
@@ -82,13 +123,34 @@ pub fn parse_blocks(blocks: &[Vec<u8>], lod: usize) -> Result<Drawable> {
     Err(first_error.unwrap())
 }
 
-/// Decodes one LOD of a drawable given its system and graphics segments.
+fn parse_dictionary(sys: &[u8], gfx: &[u8], members: &[usize], lod: usize) -> Result<Drawable> {
+    let (mut meshes, mut skipped, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, &at) in members.iter().enumerate() {
+        match parse_at(sys, gfx, at, lod) {
+            Ok(d) => {
+                let prefix: String = d.name.chars().map(|c| if c.is_ascii_alphanumeric() || "_.#-".contains(c) { c } else { '_' }).collect();
+                meshes.extend(d.meshes.into_iter().map(|m| Mesh { name: format!("{prefix}/{}", m.name), ..m }));
+                skipped.extend(d.skipped.into_iter().map(|s| format!("{prefix}/{s}")));
+            }
+            Err(e) => errors.push(format!("drawable {i}: {e:#}")),
+        }
+    }
+    ensure!(!meshes.is_empty(), "no decodable drawable in the dictionary: {}", errors.join("; "));
+    skipped.extend(errors);
+    Ok(Drawable { name: format!("drawable dictionary ({} drawables)", members.len()), lod, meshes, skipped })
+}
+
+/// Decodes one LOD of a standalone drawable given its system and graphics segments.
 pub fn parse(sys: &[u8], gfx: &[u8], lod: usize) -> Result<Drawable> {
     ensure!(looks_like(sys), "not a standalone drawable header");
+    parse_at(sys, gfx, 0, lod)
+}
+
+fn parse_at(sys: &[u8], gfx: &[u8], base: usize, lod: usize) -> Result<Drawable> {
     ensure!(lod < LOD_COUNT, "LOD {lod} out of range (0..{LOD_COUNT})");
     let r = Res { sys, gfx };
-    let name = r.name(168)?;
-    let lod_field = 80 + 8 * lod;
+    let name = r.name(base + 168)?;
+    let lod_field = base + 80 + 8 * lod;
     ensure!(r.u64(lod_field)? != 0, "drawable has no LOD {lod}");
     let group = r.ptr(lod_field, 16)?;
     let models = r.u16(group + 8)? as usize;
@@ -402,11 +464,13 @@ mod tests {
         g
     }
 
-    /// System and graphics blocks of a one-model drawable with quantized, float3 and unsupported geometries.
-    fn synthetic() -> Vec<Vec<u8>> {
-        let (mut sys, mut gfx) = (vec![0u8; 192], Vec::new());
-        put(&mut sys, 44, &f32s(&[2.0, 10.0, 20.0, 30.0]));
-        put(&mut sys, 64, &f32s(&[11.0, 21.0, 32.0]));
+    /// System and graphics blocks of a one-model drawable with quantized, float3 and unsupported geometries,
+    /// standalone or as the single entry of a drawable dictionary (offsets as seen in real dictionaries).
+    fn synthetic(dict: bool) -> Vec<Vec<u8>> {
+        let (mut sys, mut gfx) = (vec![0u8; if dict { 64 } else { 192 }], Vec::new());
+        let d = if dict { alloc(&mut sys, 192) } else { 0 };
+        put(&mut sys, d + 44, &f32s(&[2.0, 10.0, 20.0, 30.0]));
+        put(&mut sys, d + 64, &f32s(&[11.0, 21.0, 32.0]));
         let pages = alloc(&mut sys, 16);
         put(&mut sys, pages + 8, &[1, 1]);
         let shaders = alloc(&mut sys, 64);
@@ -420,7 +484,18 @@ mod tests {
             let g = geometry(&mut sys, &mut gfx, f);
             put(&mut sys, geoms + i * 8, &sp(g));
         }
-        for (at, p) in [(8, pages), (16, shaders), (80, group), (168, name)] { put(&mut sys, at, &sp(p)); }
+        put(&mut sys, 8, &sp(pages));
+        for (at, p) in [(16, shaders), (80, group), (168, name)] { put(&mut sys, d + at, &sp(p)); }
+        if dict {
+            let (hashes, values) = (alloc(&mut sys, 4), alloc(&mut sys, 8));
+            put(&mut sys, hashes, &0x1234_5678u32.to_le_bytes());
+            put(&mut sys, values, &sp(d));
+            put(&mut sys, 24, &1u32.to_le_bytes());
+            for (at, p) in [(32, hashes), (48, values)] {
+                put(&mut sys, at, &sp(p));
+                put(&mut sys, at + 8, &[1, 0, 1, 0]);
+            }
+        }
         put(&mut sys, group, &sp(list));
         put(&mut sys, group + 8, &[1, 0, 1, 0]);
         put(&mut sys, list, &sp(model));
@@ -430,8 +505,56 @@ mod tests {
     }
 
     #[test]
+    fn decodes_synthetic_dictionary() {
+        let blocks = synthetic(true);
+        assert!(!looks_like(&blocks[0]) && dictionary(&blocks[0]) == Some(vec![64]));
+        assert_eq!(page_counts(&blocks[0]), Some((1, 1)));
+        let d = parse_blocks(&blocks, 0).unwrap();
+        assert_eq!((d.meshes.len(), d.skipped.len()), (2, 1));
+        assert_eq!(d.meshes[0].name, "synthetic_prop/model_0_geometry_0");
+        assert_eq!(d.meshes[0].indices, [3, 2, 1, 3, 1, 0]);
+        assert_eq!(d.meshes[1].positions[2], [1.0, 1.0, 0.0]);
+        // A resource without graphics pages (e.g. animation or metadata) is classified, not misparsed.
+        let mut meta = vec![0u8; 64];
+        put(&mut meta, 8, &sp(32));
+        put(&mut meta, 40, &[2, 0]);
+        let e = parse_blocks(&[meta], 0).unwrap_err().to_string();
+        assert!(e.contains("2 system and no graphics pages"), "{e}");
+    }
+
+    /// Real-file check: the only drawable resource of the story content archive, when present locally.
+    #[test]
+    fn decodes_real_dictionary() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (Ok(raw), Ok(crypto)) = (std::fs::read(root.join("bin/story000_restofworld.rpf")), crate::rpf9::crypto::CryptoContext::load(&root.join("data"))) else {
+            eprintln!("skipping: bin/story000_restofworld.rpf or data/*.bin not present");
+            return;
+        };
+        use crate::rpf9::reader::Archive;
+        let outer = Archive::open(&raw, &crypto).unwrap();
+        let nested = outer.read_entry(&outer.entries()[19]).unwrap();
+        let inner = Archive::open(&nested, &crypto).unwrap();
+        let blocks = inner.read_entry_blocks(&inner.entries()[0]).unwrap();
+        let members = dictionary(&blocks[0]).unwrap();
+        let d = parse_blocks(&blocks, 0).unwrap();
+        assert_eq!((members.len(), d.meshes.len(), d.skipped.len()), (3, 3, 0));
+        let verts: usize = d.meshes.iter().map(|m| m.positions.len()).sum();
+        let tris: usize = d.meshes.iter().map(|m| m.indices.len() / 3).sum();
+        assert_eq!((verts, tris), (1808, 2620));
+        for (m, &at) in d.meshes.iter().zip(&members) {
+            let n = m.positions.len() as u32;
+            assert!(m.indices.iter().all(|&i| i < n) && m.uvs.is_some());
+            // Every vertex lies inside its drawable's header bounds, up to quantization error.
+            let (min, max) = (vec3(&blocks[0], at + 48).unwrap(), vec3(&blocks[0], at + 64).unwrap());
+            for p in &m.positions {
+                assert!((0..3).all(|k| p[k] >= min[k] - 1e-3 && p[k] <= max[k] + 1e-3), "{} {p:?}", m.name);
+            }
+        }
+    }
+
+    #[test]
     fn decodes_synthetic_drawable() {
-        let d = parse_blocks(&synthetic(), 0).unwrap();
+        let d = parse_blocks(&synthetic(false), 0).unwrap();
         assert_eq!((d.name.as_str(), d.meshes.len(), d.skipped.len()), ("synthetic_prop", 2, 1));
         assert!(d.skipped[0].contains("unsupported position format 48"), "{}", d.skipped[0]);
         let q = &d.meshes[0];
@@ -441,7 +564,7 @@ mod tests {
         assert_eq!(q.indices, [3, 2, 1, 3, 1, 0]);
         let f = &d.meshes[1];
         assert_eq!((f.positions[2], f.uvs.is_none()), ([1.0, 1.0, 0.0], true));
-        assert!(parse_blocks(&synthetic(), 1).unwrap_err().to_string().contains("no LOD 1"));
+        assert!(parse_blocks(&synthetic(false), 1).unwrap_err().to_string().contains("no LOD 1"));
 
         let glb = to_glb(&d);
         assert_eq!((&glb[0..4], u32_at(&glb, 8).unwrap() as usize), (&b"glTF"[..], glb.len()));
@@ -457,7 +580,7 @@ mod tests {
         if let Ok(path) = std::env::var("FORGE9_FIXTURE_OUT") {
             use std::io::Write;
             let mut out = Vec::new();
-            for block in synthetic() {
+            for block in synthetic(false) {
                 let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
                 z.write_all(&block).unwrap();
                 out.extend(z.finish().unwrap());
