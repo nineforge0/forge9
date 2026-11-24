@@ -39,6 +39,16 @@ forge9 info archive.rpf
 # List entries
 forge9 list archive.rpf
 forge9 list archive.rpf --json
+forge9 list archive.rpf --recursive         # nested RPF9 entries too, as 5/3 paths
+
+# Summary: entries per kind, stored and inflated bytes, nested archives, largest entries
+forge9 stats archive.rpf --top 10
+forge9 stats archive.rpf --json
+
+# Compare two archives by inflated payload: added, removed, changed (with size delta) and
+# moved entries; exit code 0 if identical, 1 if they differ, 2 on error
+forge9 diff old.rpf new.rpf
+forge9 diff original.rpf repacked.rpf --json
 
 # Nested archives and searching
 forge9 tree archive.rpf --depth 2
@@ -117,6 +127,10 @@ forge9 bcpack-analyze store.ttpf 119 -o l.bin    # one chunk; lane symbol stream
 
 # joaat hash of a name
 forge9 hash player_one
+
+# Grow the hash dictionary: name unknown PSIN schema hashes from strings found in the archives
+forge9 harvest script.rpf common.rpf > names.txt
+forge9 --dict names.txt psin script.rpf 1 --structs
 ```
 
 ### Mod packs
@@ -152,9 +166,9 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 
 | Format | Magic | Command | Status |
 |---|---|---|---|
-| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
+| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
 | zlib chains | `78 xx` | (automatic) | Inflated on read |
-| PSIN / PSO game data | `PSIN` | `psin` | Block table, struct schemas |
+| PSIN / PSO game data | `PSIN` | `psin`, `harvest` | Block table, struct schemas; schema hash names from archive strings |
 | AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
 | SGD5 shader database | `SGD5` | `shaders` | Record names, stages, tags, sizes; DXBC payload offsets |
 | Xbox shader program | `XBCH` → `FSSM` | `fssm` | XDAT section 0x0D inflated; stages, root layout, used resources |

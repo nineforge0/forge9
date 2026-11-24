@@ -29,6 +29,30 @@ enum Command {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Also list the entries of nested RPF9s, as `a/b` paths
+        #[arg(long)]
+        recursive: bool,
+    },
+    /// Summarize an archive and its nested RPF9s: entries per kind, sizes, largest entries
+    Stats {
+        archive: PathBuf,
+        /// Number of largest entries to show
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two archives (with nested RPF9s) by inflated payload; exits 1 if they differ
+    Diff {
+        old: PathBuf,
+        new: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print `hash name` lines (for --dict) naming unknown PSIN schema hashes from strings in the archives
+    Harvest {
+        #[arg(required = true)]
+        archives: Vec<PathBuf>,
     },
     /// Extract entries to a directory
     Extract {
@@ -304,7 +328,13 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Info { archive } => cmd_info(&archive, &crypto),
-        Command::List { archive, limit, json } => cmd_list(&archive, &crypto, limit, json),
+        Command::List { archive, limit, json, recursive } => cmd_list(&archive, &crypto, limit, json, recursive),
+        Command::Stats { archive, top, json } => cmd_stats(&archive, &crypto, top, json),
+        Command::Diff { old, new, json } => match cmd_diff(&old, &new, &crypto, json) {
+            Ok(differ) => std::process::exit(differ as i32),
+            Err(e) => { eprintln!("Error: {e:?}"); std::process::exit(2) }
+        },
+        Command::Harvest { archives } => cmd_harvest(&archives, &crypto, &dict),
         Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
@@ -351,28 +381,239 @@ fn cmd_info(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext) -> Result<()> 
     Ok(())
 }
 
-fn cmd_list(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, limit: usize, json: bool) -> Result<()> {
+fn cmd_list(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, limit: usize, json: bool, recursive: bool) -> Result<()> {
     let raw = std::fs::read(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
+    let mut rows = Vec::new();
+    if recursive {
+        walk(&archive, "", crypto, &mut |p, a, e, _| rows.push((p.to_string(), e.clone(), a.sniff(e), e.is_zlib(a.data()))))?;
+    } else {
+        rows.extend(archive.entries().iter().map(|e| (e.index.to_string(), e.clone(), archive.sniff(e), e.is_zlib(&raw))));
+    }
     if json {
         println!("[");
-        let total = archive.entries().len().min(limit);
-        for (i, entry) in archive.entries().iter().take(limit).enumerate() {
+        let total = rows.len().min(limit);
+        for (i, (p, entry, ext, _)) in rows.iter().take(limit).enumerate() {
             let comma = if i + 1 >= total { "" } else { "," };
-            let ext = archive.sniff(entry);
-            println!("  {{\"index\":{},\"offset\":{},\"size\":{},\"flags\":{},\"ext\":\"{ext}\"}}{comma}", entry.index, entry.offset, entry.size, entry.flags);
+            println!("  {{\"path\":\"{p}\",\"index\":{},\"offset\":{},\"size\":{},\"flags\":{},\"ext\":\"{ext}\"}}{comma}", entry.index, entry.offset, entry.size, entry.flags);
         }
         println!("]");
     } else {
-        for entry in archive.entries().iter().take(limit) {
-            let ext = archive.sniff(entry);
-            let zlib = if entry.is_zlib(&raw) { " zlib" } else { "" };
-            println!("  #{:<4} {:#010x}  {:>10} bytes  .{ext}{zlib}", entry.index, entry.offset, entry.size);
+        for (p, entry, ext, zlib) in rows.iter().take(limit) {
+            let zlib = if *zlib { " zlib" } else { "" };
+            println!("  #{p:<4} {:#010x}  {:>10} bytes  .{ext}{zlib}", entry.offset, entry.size);
         }
-        if archive.entries().len() > limit {
-            println!("  … {} more", archive.entries().len() - limit);
+        if rows.len() > limit {
+            println!("  … {} more", rows.len() - limit);
         }
     }
+    Ok(())
+}
+
+/// Calls `f(path, archive, entry, nested)` for every entry, descending into nested RPF9s; `path` is
+/// `prefix` + `a/b` as `load_entry` takes it, and `nested` is true for an entry that opened as an RPF9.
+fn walk(archive: &rpf9::reader::Archive, prefix: &str, crypto: &rpf9::crypto::CryptoContext,
+    f: &mut dyn FnMut(&str, &rpf9::reader::Archive, &rpf9::entry::Entry, bool)) -> Result<()> {
+    for entry in archive.entries() {
+        let path = format!("{prefix}{}", entry.index);
+        let bytes = if archive.sniff(entry) == "rpf" { archive.read_entry(entry).ok() } else { None };
+        let nested = match bytes.as_deref().map(|b| rpf9::reader::Archive::open(b, crypto)) {
+            Some(Ok(n)) => Some(n),
+            Some(Err(e)) => { eprintln!("  {path}: nested open failed: {e}"); None }
+            None => None,
+        };
+        f(&path, archive, entry, nested.is_some());
+        if let Some(n) = &nested { walk(n, &format!("{path}/"), crypto, f)?; }
+    }
+    Ok(())
+}
+
+/// Inflated entry content; an entry that does not read whole falls back to its readable head.
+fn content(archive: &rpf9::reader::Archive, entry: &rpf9::entry::Entry) -> Vec<u8> {
+    archive.read_entry(entry).unwrap_or_else(|_| archive.head(entry, usize::MAX))
+}
+
+#[derive(Default)]
+struct Stats {
+    /// Entries that are not nested archives (those count in `nested`, their entries here).
+    entries: usize,
+    nested: usize,
+    zlib: usize,
+    stored: u64,
+    inflated: u64,
+    /// ext -> (entries, stored, inflated)
+    kinds: std::collections::BTreeMap<&'static str, (usize, u64, u64)>,
+    /// (inflated, stored, path, ext), largest first
+    largest: Vec<(u64, u64, String, &'static str)>,
+}
+
+fn stats(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext) -> Result<Stats> {
+    let mut s = Stats::default();
+    walk(archive, "", crypto, &mut |path, a, e, nested| {
+        if nested { s.nested += 1; return; }
+        let (ext, zlib) = (a.sniff(e), e.is_zlib(a.data()));
+        let inflated = if zlib { content(a, e).len() as u64 } else { e.size };
+        s.entries += 1;
+        s.zlib += zlib as usize;
+        s.stored += e.size;
+        s.inflated += inflated;
+        let k = s.kinds.entry(ext).or_default();
+        k.0 += 1;
+        k.1 += e.size;
+        k.2 += inflated;
+        s.largest.push((inflated, e.size, path.to_string(), ext));
+    })?;
+    s.largest.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    Ok(s)
+}
+
+fn cmd_stats(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, top: usize, json: bool) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    let s = stats(&rpf9::reader::Archive::open(&raw, crypto)?, crypto)?;
+    let largest = &s.largest[..top.min(s.largest.len())];
+    if json {
+        let kinds: Vec<String> = s.kinds.iter().map(|(ext, (n, st, inf))| format!("\"{ext}\":{{\"entries\":{n},\"stored\":{st},\"inflated\":{inf}}}")).collect();
+        let largest: Vec<String> = largest.iter().map(|(inf, st, p, ext)| format!("{{\"path\":\"{p}\",\"ext\":\"{ext}\",\"stored\":{st},\"inflated\":{inf}}}")).collect();
+        println!("{{\"entries\":{},\"nested_archives\":{},\"zlib\":{},\"stored\":{},\"inflated\":{},", s.entries, s.nested, s.zlib, s.stored, s.inflated);
+        println!(" \"kinds\":{{{}}},", kinds.join(","));
+        println!(" \"largest\":[{}]}}", largest.join(","));
+        return Ok(());
+    }
+    println!("{} ({} bytes): {} entries ({} zlib), {} nested archives", path.display(), raw.len(), s.entries, s.zlib, s.nested);
+    println!("  {} bytes stored, {} inflated", s.stored, s.inflated);
+    println!("  {:<8} {:>8} {:>14} {:>14}", "kind", "entries", "stored", "inflated");
+    for (ext, (n, st, inf)) in &s.kinds { println!("  .{ext:<7} {n:>8} {st:>14} {inf:>14}"); }
+    println!("  {} largest (inflated bytes):", largest.len());
+    for (inf, st, p, ext) in largest { println!("  #{p:<10} {inf:>12} bytes ({st} stored) .{ext}"); }
+    Ok(())
+}
+
+/// A non-archive entry and its inflated payload's digest.
+#[derive(Debug, Clone)]
+struct Leaf { path: String, digest: u64, size: u64, ext: &'static str }
+
+/// Every entry except nested archives, which are compared through their entries.
+fn leaves(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext) -> Result<Vec<Leaf>> {
+    use std::hash::{Hash, Hasher};
+    let mut out = Vec::new();
+    walk(archive, "", crypto, &mut |path, a, e, nested| {
+        if nested { return; }
+        let bytes = content(a, e);
+        let mut h = std::hash::DefaultHasher::new();
+        bytes.hash(&mut h);
+        out.push(Leaf { path: path.to_string(), digest: h.finish(), size: bytes.len() as u64, ext: a.sniff(e) });
+    })?;
+    Ok(out)
+}
+
+#[derive(Default)]
+struct Diff { added: Vec<Leaf>, removed: Vec<Leaf>, changed: Vec<(Leaf, Leaf)>, moved: Vec<(Leaf, Leaf)>, same: usize }
+
+impl Diff {
+    fn differ(&self) -> bool { !(self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty() && self.moved.is_empty()) }
+}
+
+/// Pairs entries with the same payload (same path: identical, else moved), then the rest by path (changed).
+fn diff(old: Vec<Leaf>, new: Vec<Leaf>) -> Diff {
+    let mut d = Diff::default();
+    let at: std::collections::HashMap<String, usize> = new.iter().enumerate().map(|(i, l)| (l.path.clone(), i)).collect();
+    let mut new: Vec<Option<Leaf>> = new.into_iter().map(Some).collect();
+    let mut rest = Vec::new();
+    for o in old {
+        match at.get(&o.path) {
+            Some(&i) if new[i].as_ref().is_some_and(|n| n.digest == o.digest) => { new[i] = None; d.same += 1; }
+            _ => rest.push(o),
+        }
+    }
+    // Popped from the back, so the first remaining copy of a payload pairs first.
+    let mut by_digest: std::collections::HashMap<u64, Vec<usize>> = Default::default();
+    for (i, n) in new.iter().enumerate().rev() {
+        if let Some(n) = n { by_digest.entry(n.digest).or_default().push(i); }
+    }
+    let mut unpaired = Vec::new();
+    for o in rest {
+        match by_digest.get_mut(&o.digest).and_then(Vec::pop) {
+            Some(i) => d.moved.push((o, new[i].take().unwrap())),
+            None => unpaired.push(o),
+        }
+    }
+    for o in unpaired {
+        match at.get(&o.path).and_then(|&i| new[i].take()) {
+            Some(n) => d.changed.push((o, n)),
+            None => d.removed.push(o),
+        }
+    }
+    d.added = new.into_iter().flatten().collect();
+    d
+}
+
+/// Prints the differences; true if the archives differ.
+fn cmd_diff(old: &PathBuf, new: &PathBuf, crypto: &rpf9::crypto::CryptoContext, json: bool) -> Result<bool> {
+    let leaves_of = |path: &PathBuf| -> Result<Vec<Leaf>> {
+        let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        leaves(&rpf9::reader::Archive::open(&raw, crypto)?, crypto)
+    };
+    let d = diff(leaves_of(old)?, leaves_of(new)?);
+    if json {
+        let one = |l: &Leaf| format!("{{\"path\":\"{}\",\"size\":{},\"ext\":\"{}\"}}", l.path, l.size, l.ext);
+        let list = |v: &[Leaf]| v.iter().map(one).collect::<Vec<_>>().join(",");
+        let changed: Vec<String> = d.changed.iter().map(|(o, n)| format!("{{\"path\":\"{}\",\"old_size\":{},\"new_size\":{},\"ext\":\"{}\"}}", o.path, o.size, n.size, n.ext)).collect();
+        let moved: Vec<String> = d.moved.iter().map(|(o, n)| format!("{{\"old_path\":\"{}\",\"new_path\":\"{}\",\"size\":{},\"ext\":\"{}\"}}", o.path, n.path, n.size, n.ext)).collect();
+        println!("{{\"identical\":{},\"added\":[{}],\"removed\":[{}],", d.same, list(&d.added), list(&d.removed));
+        println!(" \"changed\":[{}],\"moved\":[{}]}}", changed.join(","), moved.join(","));
+        return Ok(d.differ());
+    }
+    for l in &d.removed { println!("- {:<16} {:>12} bytes .{}", l.path, l.size, l.ext); }
+    for l in &d.added { println!("+ {:<16} {:>12} bytes .{}", l.path, l.size, l.ext); }
+    for (o, n) in &d.changed {
+        println!("~ {:<16} {:>12} -> {} bytes ({:+}) .{}", o.path, o.size, n.size, n.size as i64 - o.size as i64, n.ext);
+    }
+    for (o, n) in &d.moved { println!("> {:<16} -> {} ({} bytes) .{}", o.path, n.path, n.size, n.ext); }
+    println!("{} added, {} removed, {} changed, {} moved, {} identical", d.added.len(), d.removed.len(), d.changed.len(), d.moved.len(), d.same);
+    Ok(d.differ())
+}
+
+/// Names for the PSIN schema hashes in `archives` that `dict` does not know: every identifier-like
+/// string (`[A-Za-z0-9_]{3,64}`, as found and lowercased) in any of their entries whose joaat matches one.
+/// Returns (unknown hashes, names found).
+fn harvest(archives: &[rpf9::reader::Archive], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict)
+    -> Result<(usize, std::collections::BTreeMap<u32, String>)> {
+    let mut targets = std::collections::HashSet::new();
+    for archive in archives { walk(archive, "", crypto, &mut |_, a, e, nested| {
+        if nested || a.head(e, 4) != b"PSIN" { return; }
+        let Ok(c) = rpf9::psin::PsinContainer::parse(&content(a, e)) else { return };
+        for s in &c.structs {
+            targets.insert(s.name_hash);
+            for m in &s.members { targets.extend([m.name_hash, m.extra]); }
+        }
+        for en in &c.enums {
+            targets.insert(en.name_hash);
+            targets.extend(en.values.iter().filter_map(|v| u32::try_from(v.1).ok()));
+        }
+    })?; }
+    // 0 and 0x100 (anonymous array item) are placeholders, not names.
+    targets.retain(|&h| h > 0x100 && dict.name(h).is_none());
+    let mut found = std::collections::BTreeMap::new();
+    for archive in archives { walk(archive, "", crypto, &mut |_, a, e, nested| {
+        if nested { return; }
+        let bytes = content(a, e);
+        for word in bytes.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_')).filter(|w| (3..=64).contains(&w.len())) {
+            let word = std::str::from_utf8(word).unwrap();
+            for w in [word.to_string(), word.to_ascii_lowercase()] {
+                let h = rpf9::hashes::joaat(&w);
+                if targets.contains(&h) { found.entry(h).or_insert(w); }
+            }
+        }
+    })?; }
+    Ok((targets.len(), found))
+}
+
+fn cmd_harvest(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict) -> Result<()> {
+    let raws = paths.iter().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
+    let archives = raws.iter().map(|r| rpf9::reader::Archive::open(r, crypto)).collect::<Result<Vec<_>>>()?;
+    let (unknown, found) = harvest(&archives, crypto, dict)?;
+    for (h, name) in &found { println!("{h:#010x} {name}"); }
+    eprintln!("named {} of {unknown} unknown PSIN schema hashes", found.len());
     Ok(())
 }
 
@@ -1177,4 +1418,117 @@ fn cmd_bcpack_analyze(path: &PathBuf, chunk: Option<usize>, codec: Option<&str>,
     }
     println!("    width -1/+1: {}", line.join("  "));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge9::rpf9::{crypto::{CryptoContext, TAG_IV}, header::HEADER_SIZE, hashes::joaat, reader::Archive};
+
+    /// Stand-in crypto material: identity S-boxes and T-tables that put each input byte in its
+    /// own lane of the output word (`table % 4` differs within every round word).
+    fn crypto() -> CryptoContext {
+        let mut tables: Vec<u8> = (0..16).flat_map(|_| 0..=255u8).collect();
+        for t in 0..16u32 {
+            for x in 0..256u32 { tables.extend((x << (8 * (t % 4))).to_le_bytes()); }
+        }
+        let mut keys = vec![0x8E, 0x9B, 0x3B, 0x4E];
+        keys.extend((0..0xF0u32).map(|i| (i * 37) as u8));
+        keys.extend((0..16).flat_map(|_| 0..=255u8));
+        CryptoContext::from_bytes(tables, keys).unwrap()
+    }
+
+    /// An archive of `payloads` in the stored record layout `{offset/16, ceil(size/16), size}`.
+    fn archive(crypto: &CryptoContext, payloads: &[Vec<u8>]) -> Vec<u8> {
+        let mut toc = vec![0u8; (payloads.len() * 24 + 16).next_multiple_of(16)];
+        let mut data = Vec::new();
+        for (i, p) in payloads.iter().enumerate() {
+            let at = (HEADER_SIZE + toc.len() + data.len()) as u64;
+            for (k, v) in [at / 16, (p.len() as u64).div_ceil(16), p.len() as u64].iter().enumerate() {
+                toc[i * 24 + k * 8..i * 24 + k * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            data.extend(p);
+            data.resize(data.len().next_multiple_of(16), 0);
+        }
+        let mut header = vec![0u8; HEADER_SIZE];
+        header[0..4].copy_from_slice(b"9FPR");
+        header[4..8].copy_from_slice(&((HEADER_SIZE + toc.len()) as u32).to_le_bytes());
+        header[0x24..0x28].copy_from_slice(&(payloads.len() as u32).to_le_bytes());
+        crypto.schedule(0).unwrap().encrypt_cbc(&mut toc, &TAG_IV);
+        [header, toc, data].concat()
+    }
+
+    fn zlib(data: &[u8], level: u32) -> Vec<u8> {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
+        z.write_all(data).unwrap();
+        z.finish().unwrap()
+    }
+
+    /// `[xml, rpf[a, b], zlib(c)]`
+    fn sample(crypto: &CryptoContext, b: &[u8], level: u32) -> Vec<u8> {
+        let nested = archive(crypto, &[b"alpha".to_vec(), b.to_vec()]);
+        archive(crypto, &[b"<?xml version='1.0'?><a/>".to_vec(), nested, zlib(&[b'c'; 1000], level)])
+    }
+
+    #[test]
+    fn walk_lists_nested_entries_with_paths() {
+        let crypto = crypto();
+        let raw = sample(&crypto, b"beta", 6);
+        let mut rows = Vec::new();
+        walk(&Archive::open(&raw, &crypto).unwrap(), "", &crypto, &mut |p, a, e, nested| rows.push((p.to_string(), a.sniff(e), nested))).unwrap();
+        let expect = [("0", "xml", false), ("1", "rpf", true), ("1/0", "bin", false), ("1/1", "bin", false), ("2", "bin", false)];
+        assert_eq!(rows, expect.map(|(p, e, n)| (p.to_string(), e, n)));
+    }
+
+    #[test]
+    fn stats_count_leaves_and_inflated_sizes() {
+        let crypto = crypto();
+        let raw = sample(&crypto, b"beta", 6);
+        let s = stats(&Archive::open(&raw, &crypto).unwrap(), &crypto).unwrap();
+        assert_eq!((s.entries, s.nested, s.zlib), (4, 1, 1));
+        assert_eq!(s.inflated, 25 + 5 + 4 + 1000);
+        assert!(s.stored < s.inflated);
+        assert_eq!(s.kinds["bin"].0, 3);
+        assert_eq!((s.largest[0].0, s.largest[0].2.as_str()), (1000, "2"));
+    }
+
+    #[test]
+    fn diff_compares_inflated_payloads() {
+        let crypto = crypto();
+        let leaves_of = |raw: &[u8]| leaves(&Archive::open(raw, &crypto).unwrap(), &crypto).unwrap();
+        let old = leaves_of(&sample(&crypto, b"beta", 6));
+        // Recompressed but equal content is identical.
+        let d = diff(old.clone(), leaves_of(&sample(&crypto, b"beta", 9)));
+        assert!(!d.differ());
+        assert_eq!(d.same, 4);
+        let d = diff(old.clone(), leaves_of(&sample(&crypto, b"gamma", 6)));
+        assert_eq!(d.changed.iter().map(|(o, n)| (o.path.as_str(), o.size, n.size)).collect::<Vec<_>>(), [("1/1", 4, 5)]);
+        assert!(d.added.is_empty() && d.removed.is_empty() && d.moved.is_empty());
+        // An inserted entry moves the rest; a new nested payload is added, the old one removed.
+        let shifted = &old[1..].iter().map(|l| Leaf { path: format!("{}x", l.path), ..l.clone() }).collect::<Vec<_>>();
+        let d = diff(old.clone(), shifted.iter().cloned().chain([Leaf { path: "9".into(), digest: 1, size: 1, ext: "bin" }]).collect());
+        assert_eq!((d.moved.len(), d.added.len(), d.removed.len(), d.same), (3, 1, 1, 0));
+        assert_eq!(d.removed[0].path, "0");
+    }
+
+    #[test]
+    fn harvest_names_unknown_psin_hashes() {
+        let crypto = crypto();
+        let (known, s, m) = (0xde396fe2u32, joaat("my_struct"), joaat("health_max"));
+        let mut lsch = vec![0u8; 32];
+        lsch[0..4].copy_from_slice(&s.to_le_bytes());
+        lsch[16..24].copy_from_slice(&[0xAA; 8]);
+        lsch[30..32].copy_from_slice(&2u16.to_le_bytes());
+        for name in [m, known] { lsch.extend([name.to_le_bytes(), [0; 4], [0x15, 0, 0, 0], [0; 4]].concat()); }
+        let psin = [b"PSIN".as_slice(), &8u32.to_be_bytes(), b"LSCH", &(8 + lsch.len() as u32).to_be_bytes(), &lsch].concat();
+        let text = b"<?xml?><x a=\"My_Struct\" b=\"health_max\" c=\"root_document\" d=\"nothing\"/>".to_vec();
+        // Schema in one archive, names in a nested entry of another.
+        let (a, b) = (archive(&crypto, &[psin]), archive(&crypto, &[archive(&crypto, &[zlib(&text, 6)])]));
+        let dict = rpf9::hashes::Dict::load(None).unwrap();
+        let archives = [Archive::open(&a, &crypto).unwrap(), Archive::open(&b, &crypto).unwrap()];
+        let (unknown, found) = harvest(&archives, &crypto, &dict).unwrap();
+        assert_eq!(unknown, 2);
+        assert_eq!(found, [(s, "my_struct".to_string()), (m, "health_max".to_string())].into_iter().collect());
+    }
 }
