@@ -1004,22 +1004,24 @@ fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, 
     for s in &d.skipped { eprintln!("  skipped {s}"); }
     let mut opened = Vec::new();
     for path in stores {
-        let store = texture::Store::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let texs = store.textures()?;
-        opened.push((path.file_name().unwrap_or_default().to_string_lossy().into_owned(), store, texs));
+        match texture::LazyStore::open(path) {
+            Ok(s) => opened.push((path.file_name().unwrap_or_default().to_string_lossy().into_owned(), s)),
+            Err(e) => eprintln!("  skipping store {}: {e:#}", path.display()),
+        }
     }
-    let total: usize = opened.iter().map(|(_, _, t)| t.len()).sum();
+    let total: usize = opened.iter().map(|(_, s)| s.textures.len()).sum();
     let mut resolved = 0;
     for m in &mut d.materials {
         println!("  material {} (shader {:#010x}): {} textures", m.name, m.shader, m.textures.len());
         for t in &m.textures {
-            let hit = opened.iter().find_map(|(name, store, texs)| texs.iter().find(|x| x.hash == t.key).map(|x| (name, store, x)));
+            let hit = opened.iter_mut().find_map(|(name, s)| s.textures.iter().position(|x| x.hash == t.key).map(|i| (&*name, s, i)));
             let what = match hit {
                 None => format!("not in {} stores ({total} textures)", opened.len()),
-                Some((name, store, tex)) => {
+                Some((name, s, i)) => {
                     resolved += 1;
+                    let tex = s.textures[i].clone();
                     let slot = match t.param { drawable::DIFFUSE_PARAM => Some(&mut m.base_color), drawable::BUMP_PARAM => Some(&mut m.normal), _ => None };
-                    let used = match slot.map(|s| texture::material_png(store, tex).map(|png| *s = Some(png))) {
+                    let used = match slot.map(|slot| s.load(&tex).and_then(|()| texture::material_png(&s.store, &tex)).map(|png| *slot = Some(png))) {
                         None => String::new(),
                         Some(Ok(())) => ", embedded".into(),
                         Some(Err(e)) => format!(", not decoded: {e:#}"),
@@ -1064,24 +1066,26 @@ fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, 
 
 fn cmd_texture(path: &PathBuf, extract: Option<usize>, decode: Option<usize>, output: Option<PathBuf>, slice: u32) -> Result<()> {
     use formats::texture;
-    let store = texture::Store::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let texs = store.textures()?;
+    let mut lazy = texture::LazyStore::open(path).with_context(|| format!("opening {}", path.display()))?;
     if let Some(i) = extract.or(decode) {
-        let tex = texs.get(i).ok_or_else(|| anyhow::anyhow!("texture {i} out of range ({} textures)", texs.len()))?;
+        let tex = lazy.textures.get(i).cloned().ok_or_else(|| anyhow::anyhow!("texture {i} out of range ({} textures)", lazy.textures.len()))?;
+        lazy.load(&tex)?;
+        let (store, tex) = (&lazy.store, &tex);
         let png = decode.is_some();
         let out = output.unwrap_or_else(|| PathBuf::from(format!("texture_{i}.{}", if png { "png" } else { "dds" })));
-        let (bytes, unfitted) = texture::export(&store, tex, png, slice)?;
+        let (bytes, unfitted) = texture::export(store, tex, png, slice)?;
         std::fs::write(&out, bytes)?;
         let sl = if tex.array_size > 1 { format!(" slice {slice}") } else { String::new() };
         println!("texture {i}: {} {}x{}{sl} mip 0 → {}", texture::dxgi_name(tex.dxgi), tex.width, tex.height, out.display());
         if unfitted > 0 { println!("  warning: {unfitted} blocks depend on table values bcpack-rs marks undetermined and may be off"); }
         return Ok(());
     }
+    let (store, texs) = (&lazy.store, &lazy.textures);
     let mut codecs = std::collections::BTreeMap::new();
     for c in &store.chunks { *codecs.entry(texture::codec_name(c.codec)).or_insert(0usize) += 1; }
     let codecs: Vec<String> = codecs.iter().map(|(k, n)| format!("{n} {k}")).collect();
     println!("{}: {} chunks ({}), {} textures", path.display(), store.chunks.len(), codecs.join(", "), texs.len());
-    for t in &texs {
+    for t in texs {
         let array = if t.array_size > 1 { format!(" x{}", t.array_size) } else { String::new() };
         println!("  #{:<5} {:>5}x{:<5}{array} {:<5} (dxgi {:>2}) mips {:>2} tile {}  hash {:016x}", t.index, t.width, t.height, texture::dxgi_name(t.dxgi), t.dxgi, t.mips, t.tile_mode, t.hash);
     }
