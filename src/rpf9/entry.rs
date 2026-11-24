@@ -47,7 +47,7 @@ fn decode(bytes: &[u8]) -> Option<(u64, Option<u64>)> {
     let quad = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
     let (units, blocks, size) = (quad(0), quad(8), quad(16));
     if units != 0 && size != 0 && blocks == size.div_ceil(16) {
-        return Some((units * 16, Some(size)));
+        return Some((units.saturating_mul(16), Some(size)));
     }
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
     if word(4) != 0 || word(20) != 0 || word(8) == 0 { return None; }
