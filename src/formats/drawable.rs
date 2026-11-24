@@ -38,9 +38,10 @@ const MAX_SYSTEM: u64 = 32 << 20;
 const NORMAL_SEMANTIC: usize = 4;
 const UV_SEMANTICS: [usize; 2] = [28, 29];
 const COLOR_SEMANTIC: usize = 24;
-/// joaat of the texture parameter names `diffusetex` and `bumptex`.
+/// joaat of the texture parameter names `diffusetex`, `bumptex` and `emissivetex`.
 pub const DIFFUSE_PARAM: u32 = 0xc8e8_c282;
 pub const BUMP_PARAM: u32 = 0x1e77_bf4c;
+pub const EMISSIVE_PARAM: u32 = 0x8e0d_63ee;
 
 #[derive(Debug)]
 pub struct Mesh {
@@ -75,6 +76,7 @@ pub struct Material {
     /// PNG images, filled in by the caller after resolving `textures`.
     pub base_color: Option<Vec<u8>>,
     pub normal: Option<Vec<u8>>,
+    pub emissive: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -167,22 +169,38 @@ pub fn parse_blocks(blocks: &[Vec<u8>], lod: usize) -> Result<Drawable> {
 }
 
 fn parse_dictionary(sys: &[u8], gfx: &[u8], members: &[usize], lod: usize) -> Result<Drawable> {
-    let (mut meshes, mut materials, mut skipped, mut errors) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut parts, mut errors) = (Vec::new(), Vec::new());
     for (i, &at) in members.iter().enumerate() {
         match parse_at(sys, gfx, at, lod) {
             Ok(d) => {
                 let prefix: String = d.name.chars().map(|c| if c.is_ascii_alphanumeric() || "_.#-".contains(c) { c } else { '_' }).collect();
-                let base = materials.len();
-                meshes.extend(d.meshes.into_iter().map(|m| Mesh { name: format!("{prefix}/{}", m.name), material: m.material.map(|i| base + i), ..m }));
-                materials.extend(d.materials.into_iter().map(|m| Material { name: format!("{prefix}/{}", m.name), ..m }));
-                skipped.extend(d.skipped.into_iter().map(|s| format!("{prefix}/{s}")));
+                parts.push(Drawable {
+                    meshes: d.meshes.into_iter().map(|m| Mesh { name: format!("{prefix}/{}", m.name), ..m }).collect(),
+                    materials: d.materials.into_iter().map(|m| Material { name: format!("{prefix}/{}", m.name), ..m }).collect(),
+                    skipped: d.skipped.into_iter().map(|s| format!("{prefix}/{s}")).collect(),
+                    ..d
+                });
             }
             Err(e) => errors.push(format!("drawable {i}: {e:#}")),
         }
     }
-    ensure!(!meshes.is_empty(), "no decodable drawable in the dictionary: {}", errors.join("; "));
-    skipped.extend(errors);
-    Ok(Drawable { name: format!("drawable dictionary ({} drawables)", members.len()), lod, meshes, materials, skipped })
+    let mut d = merge(format!("drawable dictionary ({} drawables)", members.len()), parts);
+    ensure!(!d.meshes.is_empty(), "no decodable drawable in the dictionary: {}", errors.join("; "));
+    d.skipped.extend(errors);
+    Ok(d)
+}
+
+/// Several drawables as one scene: meshes, materials and skip notes concatenated, material indices rebased.
+pub fn merge(name: String, parts: Vec<Drawable>) -> Drawable {
+    let lod = parts.first().map_or(0, |d| d.lod);
+    let (mut meshes, mut materials, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
+    for d in parts {
+        let base = materials.len();
+        meshes.extend(d.meshes.into_iter().map(|m| Mesh { material: m.material.map(|i| base + i), ..m }));
+        materials.extend(d.materials);
+        skipped.extend(d.skipped);
+    }
+    Drawable { name, lod, meshes, materials, skipped }
 }
 
 /// Decodes one LOD of a standalone drawable given its system and graphics segments.
@@ -464,7 +482,9 @@ pub fn to_gltf(d: &Drawable, uri: Option<&str>) -> (String, Vec<u8>) {
         });
         let base = texture(&m.base_color, "baseColorTexture");
         let normal = texture(&m.normal, "normalTexture");
-        materials.push(format!(r#"{{"name":"{}","pbrMetallicRoughness":{{"metallicFactor":0{base}}}{normal}}}"#, m.name));
+        let mut emissive = texture(&m.emissive, "emissiveTexture");
+        if !emissive.is_empty() { emissive += r#","emissiveFactor":[1,1,1]"#; }
+        materials.push(format!(r#"{{"name":"{}","pbrMetallicRoughness":{{"metallicFactor":0{base}}}{normal}{emissive}}}"#, m.name));
     }
     for m in &d.meshes {
         let n = m.positions.len();
@@ -705,6 +725,14 @@ mod tests {
         assert!(json.contains(r#""textures":[{"source":0},{"source":1}],"images":[{"bufferView":0,"mimeType":"image/png"},{"bufferView":1,"mimeType":"image/png"}]"#), "{json}");
         assert!(json.contains(r#"{"buffer":0,"byteOffset":0,"byteLength":5},{"buffer":0,"byteOffset":8,"byteLength":6},{"buffer":0,"byteOffset":16,"#), "{json}");
         assert_eq!(&bin[8..14], b"\x89PNG22");
+        d.materials[0].emissive = Some(b"\x89PNG3".to_vec());
+        let json = to_gltf(&d, None).0;
+        assert!(json.contains(r#""normalTexture":{"index":1},"emissiveTexture":{"index":2},"emissiveFactor":[1,1,1]}"#), "{json}");
+        // Merged drawables keep each mesh on its own material.
+        let two = merge("pair".into(), vec![parse_blocks(&synthetic(true), 0).unwrap(), d]);
+        assert_eq!((two.name.as_str(), two.meshes.len(), two.materials.len()), ("pair", 4, 2));
+        assert_eq!(two.meshes.iter().map(|m| m.material).collect::<Vec<_>>(), [Some(0), Some(0), Some(1), Some(1)]);
+        assert!(to_gltf(&two, None).0.contains(r#""material":1"#));
         // A broken shader group drops the materials, not the geometry.
         let mut blocks = synthetic(false);
         put(&mut blocks[0], 16, &sp(1 << 20));
