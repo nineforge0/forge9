@@ -18,8 +18,14 @@
 //!   position format 66 is 8-byte quantized, 99 is float3
 //! - semantic 4 (normal): one u32 per vertex, bits 0..9 / 10..19 an octahedral
 //!   unit vector (unorm10 each); semantics 28 / 29: texcoords, snorm16x2 x `+0x7C f32`
+//! - semantic 24: RGBA8 per vertex (exported as `_COLOR_0`, it is not an albedo tint)
 //! - index data is clustered: per-cluster 7-bit triangle corners remapped
 //!   through a u16/u32 global vertex table
+//! - shader group (header +0x10): `+0x10 {ptr shaders, u16 count, u16 capacity}`;
+//!   shader: +0x00 u32 hash, +0x10 texture slot pointers, +0x20 parameter table
+//!   (`+0x01 u8 textures`, 8-byte `{u32 joaat name, u32 slot << 2}` entries from +0x08);
+//!   texture reference +0x30 points to `{tagged ptr to {u64, u32 name hash}, u64 store key}`;
+//!   model +0x20 points to one u16 shader index per geometry
 
 use anyhow::{bail, ensure, Context, Result};
 use std::fmt::Write as _;
@@ -31,6 +37,10 @@ const HEADER: usize = 176;
 const MAX_SYSTEM: u64 = 32 << 20;
 const NORMAL_SEMANTIC: usize = 4;
 const UV_SEMANTICS: [usize; 2] = [28, 29];
+const COLOR_SEMANTIC: usize = 24;
+/// joaat of the texture parameter names `diffusetex` and `bumptex`.
+pub const DIFFUSE_PARAM: u32 = 0xc8e8_c282;
+pub const BUMP_PARAM: u32 = 0x1e77_bf4c;
 
 #[derive(Debug)]
 pub struct Mesh {
@@ -41,7 +51,30 @@ pub struct Mesh {
     pub uvs: Option<Vec<[f32; 2]>>,
     /// Second texcoord set (glTF TEXCOORD_1 only).
     pub uvs1: Option<Vec<[f32; 2]>>,
+    /// Semantic 24, RGBA8.
+    pub colors: Option<Vec<[u8; 4]>>,
     pub indices: Vec<u32>,
+    /// Index into `Drawable::materials`.
+    pub material: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextureRef {
+    /// joaat of the shader parameter name (e.g. `DIFFUSE_PARAM`).
+    pub param: u32,
+    pub name_hash: u32,
+    /// Looked up in the `.ttpf` texture index.
+    pub key: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct Material {
+    pub name: String,
+    pub shader: u32,
+    pub textures: Vec<TextureRef>,
+    /// PNG images, filled in by the caller after resolving `textures`.
+    pub base_color: Option<Vec<u8>>,
+    pub normal: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -49,6 +82,7 @@ pub struct Drawable {
     pub name: String,
     pub lod: usize,
     pub meshes: Vec<Mesh>,
+    pub materials: Vec<Material>,
     /// Geometries left out, with the reason (e.g. an unhandled vertex format).
     pub skipped: Vec<String>,
 }
@@ -133,12 +167,14 @@ pub fn parse_blocks(blocks: &[Vec<u8>], lod: usize) -> Result<Drawable> {
 }
 
 fn parse_dictionary(sys: &[u8], gfx: &[u8], members: &[usize], lod: usize) -> Result<Drawable> {
-    let (mut meshes, mut skipped, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut meshes, mut materials, mut skipped, mut errors) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (i, &at) in members.iter().enumerate() {
         match parse_at(sys, gfx, at, lod) {
             Ok(d) => {
                 let prefix: String = d.name.chars().map(|c| if c.is_ascii_alphanumeric() || "_.#-".contains(c) { c } else { '_' }).collect();
-                meshes.extend(d.meshes.into_iter().map(|m| Mesh { name: format!("{prefix}/{}", m.name), ..m }));
+                let base = materials.len();
+                meshes.extend(d.meshes.into_iter().map(|m| Mesh { name: format!("{prefix}/{}", m.name), material: m.material.map(|i| base + i), ..m }));
+                materials.extend(d.materials.into_iter().map(|m| Material { name: format!("{prefix}/{}", m.name), ..m }));
                 skipped.extend(d.skipped.into_iter().map(|s| format!("{prefix}/{s}")));
             }
             Err(e) => errors.push(format!("drawable {i}: {e:#}")),
@@ -146,7 +182,7 @@ fn parse_dictionary(sys: &[u8], gfx: &[u8], members: &[usize], lod: usize) -> Re
     }
     ensure!(!meshes.is_empty(), "no decodable drawable in the dictionary: {}", errors.join("; "));
     skipped.extend(errors);
-    Ok(Drawable { name: format!("drawable dictionary ({} drawables)", members.len()), lod, meshes, skipped })
+    Ok(Drawable { name: format!("drawable dictionary ({} drawables)", members.len()), lod, meshes, materials, skipped })
 }
 
 /// Decodes one LOD of a standalone drawable given its system and graphics segments.
@@ -166,21 +202,26 @@ fn parse_at(sys: &[u8], gfx: &[u8], base: usize, lod: usize) -> Result<Drawable>
     ensure!((1..=256).contains(&models) && models == r.u16(group + 10)? as usize, "bad LOD model count {models}");
     let list = r.ptr(group, models * 8)?;
     let (mut meshes, mut skipped) = (Vec::new(), Vec::new());
+    let materials = r.shaders(base + 16).unwrap_or_else(|e| { skipped.push(format!("shader group: {e:#}")); Vec::new() });
     for mi in 0..models {
         let model = r.ptr(list + mi * 8, 56)?;
         let count = r.u16(model + 16)? as usize;
         ensure!((1..=1024).contains(&count) && count == r.u16(model + 18)? as usize, "model {mi}: bad geometry count {count}");
         let geometries = r.ptr(model + 8, count * 8)?;
+        let shader_ix = if r.u64(model + 32)? == 0 { None } else { Some(r.ptr(model + 32, count * 2)?) };
         for gi in 0..count {
             let name = format!("model_{mi}_geometry_{gi}");
             match r.ptr(geometries + gi * 8, 160).and_then(|g| r.mesh(g, name.clone())) {
-                Ok(m) => meshes.push(m),
+                Ok(mut m) => {
+                    m.material = shader_ix.map(|at| r.u16(at + gi * 2).unwrap() as usize).filter(|&i| i < materials.len());
+                    meshes.push(m);
+                }
                 Err(e) => skipped.push(format!("{name}: {e:#}")),
             }
         }
     }
     ensure!(!meshes.is_empty(), "no decodable geometry in LOD {lod}: {}", skipped.join("; "));
-    Ok(Drawable { name, lod, meshes, skipped })
+    Ok(Drawable { name, lod, meshes, materials, skipped })
 }
 
 struct Res<'a> {
@@ -251,8 +292,37 @@ impl Res<'_> {
         ensure!(positions.iter().all(|&p| finite(p)), "non-finite vertex positions");
         let normals = self.normals(layout, count, vertex)?;
         let [uvs, uvs1] = [0, 1].map(|i| self.uvs(layout, UV_SEMANTICS[i], count, vertex));
+        let colors = self.attribute(layout, COLOR_SEMANTIC, 4, 28, 6, count, vertex)?
+            .map(|at| (0..count).map(|i| vertex[at + i * 4..][..4].try_into().unwrap()).collect());
         let indices = self.indices(geometry, count)?;
-        Ok(Mesh { name, positions, normals, uvs: uvs?, uvs1: uvs1?, indices })
+        Ok(Mesh { name, positions, normals, uvs: uvs?, uvs1: uvs1?, colors, indices, material: None })
+    }
+
+    /// Shaders of the shader group the pointer at `at` refers to, with their texture references.
+    fn shaders(&self, at: usize) -> Result<Vec<Material>> {
+        let group = self.ptr(at, 32)?;
+        let n = self.u16(group + 24)? as usize;
+        ensure!(n <= 256 && n == self.u16(group + 26)? as usize, "bad shader count {n}");
+        if n == 0 { return Ok(Vec::new()); }
+        let list = self.ptr(group + 16, n * 8)?;
+        (0..n).map(|i| {
+            let shader = self.ptr(list + i * 8, 48)?;
+            let table = self.ptr(shader + 32, 8)?;
+            let mut textures = Vec::new();
+            for k in 0..self.u8(table + 1)? as usize {
+                let (param, slot) = (self.u32(table + 8 + k * 8)?, self.u32(table + 12 + k * 8)?);
+                ensure!(slot & !0xFC == 0, "shader {i}: texture parameter {param:#010x} has slot word {slot:#x}");
+                let slot = self.ptr(shader + 16, slot as usize * 2 + 8)? + slot as usize * 2;
+                if self.u64(slot)? == 0 { continue; }
+                let name = self.ptr(self.ptr(slot, 80)? + 48, 16)?;
+                let tagged = self.u64(name)?;
+                let rec = (tagged & !15).checked_sub(VIRTUAL_BASE).map(|o| o as usize).filter(|o| o + 16 <= self.sys.len())
+                    .with_context(|| format!("shader {i}: bad texture name pointer {tagged:#x}"))?;
+                textures.push(TextureRef { param, name_hash: self.u32(rec + 8)?, key: self.u64(name + 8)? });
+            }
+            let hash = self.u32(shader)?;
+            Ok(Material { name: format!("shader_{i}_{hash:08x}"), shader: hash, textures, ..Default::default() })
+        }).collect()
     }
 
     /// Offset of semantic `sem` when the layout declares `(size, format)` and a vertex
@@ -376,13 +446,26 @@ pub fn to_obj(d: &Drawable) -> String {
 }
 
 /// glTF 2.0 JSON plus its binary buffer. `uri` names an external .bin; `None` is for GLB.
+/// Material images are embedded PNGs; semantic 24 goes to the custom `_COLOR_0`.
 pub fn to_gltf(d: &Drawable, uri: Option<&str>) -> (String, Vec<u8>) {
     let (mut bin, mut views, mut accessors, mut meshes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut view = |bin: &mut Vec<u8>, bytes: Vec<u8>, target: u32| {
-        views.push(format!(r#"{{"buffer":0,"byteOffset":{},"byteLength":{},"target":{target}}}"#, bin.len(), bytes.len()));
+        let target = if target == 0 { String::new() } else { format!(r#","target":{target}"#) };
+        views.push(format!(r#"{{"buffer":0,"byteOffset":{},"byteLength":{}{target}}}"#, bin.len(), bytes.len()));
         bin.extend(bytes);
+        bin.resize(bin.len().next_multiple_of(4), 0);
         views.len() - 1
     };
+    let (mut materials, mut images) = (Vec::new(), Vec::new());
+    for m in &d.materials {
+        let mut texture = |png: &Option<Vec<u8>>, key: &str| png.as_ref().map_or(String::new(), |png| {
+            images.push(format!(r#"{{"bufferView":{},"mimeType":"image/png"}}"#, view(&mut bin, png.clone(), 0)));
+            format!(r#","{key}":{{"index":{}}}"#, images.len() - 1)
+        });
+        let base = texture(&m.base_color, "baseColorTexture");
+        let normal = texture(&m.normal, "normalTexture");
+        materials.push(format!(r#"{{"name":"{}","pbrMetallicRoughness":{{"metallicFactor":0{base}}}{normal}}}"#, m.name));
+    }
     for m in &d.meshes {
         let n = m.positions.len();
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -402,21 +485,30 @@ pub fn to_gltf(d: &Drawable, uri: Option<&str>) -> (String, Vec<u8>) {
             accessors.push(format!(r#"{{"bufferView":{v},"componentType":5126,"count":{n},"type":"VEC2"}}"#));
             let _ = write!(attributes, r#","TEXCOORD_{set}":{}"#, accessors.len() - 1);
         }
+        if let Some(colors) = &m.colors {
+            let v = view(&mut bin, colors.concat(), 34962);
+            accessors.push(format!(r#"{{"bufferView":{v},"componentType":5121,"normalized":true,"count":{n},"type":"VEC4"}}"#));
+            let _ = write!(attributes, r#","_COLOR_0":{}"#, accessors.len() - 1);
+        }
         let v = view(&mut bin, m.indices.iter().flat_map(|i| i.to_le_bytes()).collect(), 34963);
         accessors.push(format!(r#"{{"bufferView":{v},"componentType":5125,"count":{},"type":"SCALAR"}}"#, m.indices.len()));
-        meshes.push(format!(r#"{{"name":"{}","primitives":[{{"attributes":{{{attributes}}},"indices":{}}}]}}"#, m.name, accessors.len() - 1));
+        let material = m.material.map_or(String::new(), |i| format!(r#","material":{i}"#));
+        meshes.push(format!(r#"{{"name":"{}","primitives":[{{"attributes":{{{attributes}}},"indices":{}{material}}}]}}"#, m.name, accessors.len() - 1));
     }
+    let list = |key: &str, items: Vec<String>| if items.is_empty() { String::new() } else { format!(r#","{key}":[{}]"#, items.join(",")) };
+    let textures = list("textures", (0..images.len()).map(|i| format!(r#"{{"source":{i}}}"#)).collect());
+    let extra = list("materials", materials) + &textures + &list("images", images);
     let children: Vec<String> = (1..=meshes.len()).map(|i| i.to_string()).collect();
     let mut nodes = vec![format!(r#"{{"name":"drawable","rotation":[-0.70710677,0,0,0.70710677],"children":[{}]}}"#, children.join(","))];
     nodes.extend((0..meshes.len()).map(|i| format!(r#"{{"mesh":{i}}}"#)));
     let uri = uri.map_or(String::new(), |u| format!(r#","uri":"{u}""#));
     let json = format!(
-        r#"{{"asset":{{"version":"2.0","generator":"forge9"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{}],"meshes":[{}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}{uri}}}]}}"#,
+        r#"{{"asset":{{"version":"2.0","generator":"forge9"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{}],"meshes":[{}]{extra},"accessors":[{}],"bufferViews":[{}],"buffers":[{{"byteLength":{}{uri}}}]}}"#,
         nodes.join(","), meshes.join(","), accessors.join(","), views.join(","), bin.len());
     (json, bin)
 }
 
-/// Binary glTF container (all buffer views are 4-byte multiples already).
+/// Binary glTF container (`to_gltf` pads every buffer view to 4 bytes).
 pub fn to_glb(d: &Drawable) -> Vec<u8> {
     let (json, bin) = to_gltf(d, None);
     let mut json = json.into_bytes();
@@ -473,6 +565,8 @@ mod tests {
             put(&mut v, 160, &f32s(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]));
             put(&mut v, 8, &(192u32 << 7 | 4 << 3 | 1).to_le_bytes());
             for (i, n) in NORMALS.into_iter().enumerate() { put(&mut v, 192 + i * 4, &oct10(n).to_le_bytes()); }
+            put(&mut v, 16, &(208u32 << 7 | 4 << 3 | 6).to_le_bytes());
+            for i in 0..4u8 { put(&mut v, 208 + i as usize * 4, &[255, 255, 20 + i, 255]); }
         } else {
             put(&mut v, at, &f32s(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]));
         }
@@ -503,7 +597,7 @@ mod tests {
         put(sys, layout + 0xD0, &[size]);
         put(sys, layout + 0x104, &[lfmt]);
         if format == 66 {
-            for (sem, at, size, format) in [(UV_SEMANTICS[0], 160u32, 8, 16), (NORMAL_SEMANTIC, 192, 4, 41)] {
+            for (sem, at, size, format) in [(UV_SEMANTICS[0], 160u32, 8, 16), (NORMAL_SEMANTIC, 192, 4, 41), (COLOR_SEMANTIC, 208, 4, 28)] {
                 put(sys, layout + sem * 4, &at.to_le_bytes());
                 put(sys, layout + 0xD0 + sem, &[size]);
                 put(sys, layout + 0x104 + sem, &[format]);
@@ -529,7 +623,7 @@ mod tests {
         put(&mut sys, d + 64, &f32s(&[11.0, 21.0, 32.0]));
         let pages = alloc(&mut sys, 16);
         put(&mut sys, pages + 8, &[1, 1]);
-        let shaders = alloc(&mut sys, 64);
+        let shaders = shader_group(&mut sys);
         let name = alloc(&mut sys, 16);
         put(&mut sys, name, b"synthetic_prop\0");
         let group = alloc(&mut sys, 16);
@@ -557,7 +651,65 @@ mod tests {
         put(&mut sys, list, &sp(model));
         put(&mut sys, model + 8, &sp(geoms));
         put(&mut sys, model + 16, &[3, 0, 3, 0]);
+        let shader_ix = alloc(&mut sys, 6);
+        put(&mut sys, model + 32, &sp(shader_ix));
         vec![sys, gfx]
+    }
+
+    /// One shader with `diffusetex` (slot 0), an unbound `tintpalettetex` (slot 1) and `bumptex` (slot 2).
+    fn shader_group(sys: &mut Vec<u8>) -> usize {
+        let (group, list, shader) = (alloc(sys, 64), alloc(sys, 8), alloc(sys, 64));
+        let (table, slots) = (alloc(sys, 32), alloc(sys, 24));
+        put(sys, group + 16, &sp(list));
+        put(sys, group + 24, &[1, 0, 1, 0]);
+        put(sys, list, &sp(shader));
+        put(sys, shader, &0xabcd_0001u32.to_le_bytes());
+        put(sys, shader + 16, &sp(slots));
+        put(sys, shader + 32, &sp(table));
+        put(sys, table, &[1, 3, 0, 0, 3]);
+        for (k, (param, slot)) in [(DIFFUSE_PARAM, 0u32), (0x2c8d_7182, 4), (BUMP_PARAM, 8)].into_iter().enumerate() {
+            put(sys, table + 8 + k * 8, &param.to_le_bytes());
+            put(sys, table + 12 + k * 8, &slot.to_le_bytes());
+            if k == 1 { continue; }
+            let (tex, name, rec) = (alloc(sys, 80), alloc(sys, 16), alloc(sys, 16));
+            put(sys, slots + slot as usize * 2, &sp(tex));
+            put(sys, tex + 48, &sp(name));
+            put(sys, name, &sp(rec + 5));
+            put(sys, name + 8, &(0x1111_2222_3333_4444u64 * (k as u64 + 1)).to_le_bytes());
+            put(sys, rec, &6u64.to_le_bytes());
+            put(sys, rec + 8, &(0x5000 + k as u32).to_le_bytes());
+        }
+        group
+    }
+
+    #[test]
+    fn decodes_shader_textures_and_colors() {
+        let mut d = parse_blocks(&synthetic(true), 0).unwrap();
+        assert_eq!(d.materials.len(), 1);
+        let m = &d.materials[0];
+        assert_eq!((m.name.as_str(), m.shader), ("synthetic_prop/shader_0_abcd0001", 0xabcd_0001));
+        assert_eq!(m.textures, [
+            TextureRef { param: DIFFUSE_PARAM, name_hash: 0x5000, key: 0x1111_2222_3333_4444 },
+            TextureRef { param: BUMP_PARAM, name_hash: 0x5002, key: 0x3333_6666_9999_cccc },
+        ]);
+        assert!(d.meshes.iter().all(|m| m.material == Some(0)));
+        assert_eq!(d.meshes[0].colors.as_deref(), Some(&[[255, 255, 20, 255], [255, 255, 21, 255], [255, 255, 22, 255], [255, 255, 23, 255]][..]));
+        assert!(d.meshes[1].colors.is_none());
+
+        let json = to_gltf(&d, None).0;
+        assert!(json.contains(r#""_COLOR_0":3"#) && json.contains(r#""material":0"#) && !json.contains("images"), "{json}");
+        d.materials[0].base_color = Some(b"\x89PNG1".to_vec());
+        d.materials[0].normal = Some(b"\x89PNG22".to_vec());
+        let (json, bin) = to_gltf(&d, None);
+        assert!(json.contains(r#""pbrMetallicRoughness":{"metallicFactor":0,"baseColorTexture":{"index":0}},"normalTexture":{"index":1}"#), "{json}");
+        assert!(json.contains(r#""textures":[{"source":0},{"source":1}],"images":[{"bufferView":0,"mimeType":"image/png"},{"bufferView":1,"mimeType":"image/png"}]"#), "{json}");
+        assert!(json.contains(r#"{"buffer":0,"byteOffset":0,"byteLength":5},{"buffer":0,"byteOffset":8,"byteLength":6},{"buffer":0,"byteOffset":16,"#), "{json}");
+        assert_eq!(&bin[8..14], b"\x89PNG22");
+        // A broken shader group drops the materials, not the geometry.
+        let mut blocks = synthetic(false);
+        put(&mut blocks[0], 16, &sp(1 << 20));
+        let d = parse_blocks(&blocks, 0).unwrap();
+        assert!(d.materials.is_empty() && d.meshes.iter().all(|m| m.material.is_none()) && d.skipped[0].starts_with("shader group"), "{:?}", d.skipped);
     }
 
     #[test]
@@ -602,6 +754,13 @@ mod tests {
         let verts: usize = d.meshes.iter().map(|m| m.positions.len()).sum();
         let tris: usize = d.meshes.iter().map(|m| m.indices.len() / 3).sum();
         assert_eq!((verts, tris), (1808, 2620));
+        // One shader per drawable, all binding the same four textures; colors are RGBA8 with R = G = A = 255.
+        assert_eq!(d.materials.len(), 3);
+        let params: Vec<u32> = d.materials[0].textures.iter().map(|t| t.param).collect();
+        assert_eq!(params, [DIFFUSE_PARAM, 0x739e_3d0d, 0xc6f4_6e79, BUMP_PARAM]);
+        assert!(d.materials.iter().all(|m| m.shader == 0xbeac_bf33 && m.textures == d.materials[0].textures));
+        assert!(d.meshes.iter().enumerate().all(|(i, m)| m.material == Some(i)));
+        assert!(d.meshes.iter().all(|m| m.colors.as_ref().unwrap().iter().all(|c| c[0] == 255 && c[1] == 255 && c[3] == 255)));
         for (m, &at) in d.meshes.iter().zip(&members) {
             let n = m.positions.len() as u32;
             assert!(m.indices.iter().all(|&i| i < n));

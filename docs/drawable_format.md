@@ -68,7 +68,7 @@ they are metadata, not geometry.
 |-------:|-------|----------------|
 | +0x00 | u64 0 | 0 |
 | +0x08 | page map pointer (0 inside a dictionary) | 0 |
-| +0x10 | shader group pointer | 0x50001990 |
+| +0x10 | shader group pointer (see below) | 0x50001990 |
 | +0x18 | skeleton pointer | 0 |
 | +0x20 | f32x3 bounding sphere center | (0, -0.0194, -0.0024) |
 | +0x2C | f32 bounding sphere radius | 1.0741 |
@@ -88,8 +88,9 @@ all three members.
   (0x1e00: `0x50001fa8, 1, 1`).
 - Model (0x1a10): +0x08 pointer to geometry pointers, +0x10 u16 count,
   +0x12 u16 capacity, +0x18 pointer to f32x4 min/max AABBs (0x1bd0 holds the
-  same bounds as the header), +0x20 a pointer (likely per-geometry shader
-  indices; not decoded), +0x30 flags.
+  same bounds as the header), +0x20 pointer to one u16 shader index per
+  geometry (0x1e10: 0; the width is assumed, every sample is a single 0),
+  +0x30 flags.
 - Geometry (0x1440): +0x08 vertex buffer pointer, +0x40 index descriptor
   pointer, +0x90 vertex layout pointer (same as the vertex buffer's), +0xA0
   f32x4 min, f32x4 max, then three f32x4 rows of an orthonormal 3x3 (looks
@@ -112,7 +113,7 @@ meaning. All three members use the same five semantics:
 |---------:|-----:|-------:|-----------:|---------|---------|
 | 0 | 8 | 16 | 0x42 (66) | quantized position | yes |
 | 4 | 4 | 41 | 0x21 (33) | normal, octahedral 10:10 + 12 more bits | normal yes, upper bits no |
-| 24 | 4 | 28 | 0x26 (38) | RGBA8, values like 0xff1bffff (vertex color) | no |
+| 24 | 4 | 28 | 0x26 (38) | RGBA8 per vertex | yes (`_COLOR_0`) |
 | 28 | 4 | 38 | 0x28 (40) | texcoord set 0, snorm16x2 | yes (TEXCOORD_0) |
 | 29 | 4 | 38 | 0x28 (40) | texcoord set 1, snorm16x2 | yes (TEXCOORD_1) |
 
@@ -142,6 +143,14 @@ lengths of 0.06..1.5; the first two fields matched `n.xy / (|x|+|y|+|z|)`
 of the face normal (for example face `(-0.060, 0.267, 0.962)` vs stored
 `(-0.046, 0.208)`), which is the octahedral projection. Semantic 24 decoded
 in every candidate scheme gave a mean dot of at most 0.2 (it is color).
+
+### RGBA8 attribute (semantic 24)
+
+Bytes in R, G, B, A order. In all 1808 vertices R = G = A = 255 and B is
+19..34 (jaw_01: 23 or 24 for 157 of 357). That is not an albedo tint (as glTF
+`COLOR_0` it would turn the models saturated yellow), so it is exported as
+the application-specific `_COLOR_0` attribute, which viewers ignore and DCC
+tools import as a plain attribute. Its meaning (masks, wind, AO) is unknown.
 
 ### Texcoords (semantics 28, 29)
 
@@ -202,7 +211,85 @@ Tests in `src/formats/drawable.rs` (the real-file ones skip when the archive
 is absent): `decodes_real_dictionary` (counts, bounds),
 `decodes_real_normals_and_texcoords` (unit length, at least 97% agreement
 with face normals, UV ranges), `rejects_real_effect_objects`, plus the
-synthetic `decodes_octahedral_normals` and `rejects_list_in_lod_slot`.
+synthetic `decodes_octahedral_normals`, `rejects_list_in_lod_slot` and
+`decodes_shader_textures_and_colors`. `decodes_real_dictionary` also checks
+the shader decode (one shader per drawable, the four texture parameters
+below, R = G = A = 255 in semantic 24).
+
+## Shader group and texture references
+
+Shader group (64 bytes, jaw at 0x1990, skull_01 0x1a50, skull_02 0x1b10):
+
+| Offset | Value | Evidence |
+|-------:|-------|----------|
+| +0x00 | u64 0 | all 3 |
+| +0x08 | u64 0 (an embedded texture dictionary would be expected here; none to check) | all 3 |
+| +0x10 | `{ptr shader pointers, u16 count, u16 capacity}` | `0x50001fa0, 1, 1` in all 3 |
+| +0x20..+0x40 | zero | all 3 |
+
+Shader (64 bytes, jaw at 0x19d0):
+
+| Offset | Value | Evidence |
+|-------:|-------|----------|
+| +0x00 | u32 0xbeacbf33 (shader hash; name not found) | all 3 |
+| +0x04 | u32 0x6d657461 | all 3 |
+| +0x08 | pointer to the constant buffer (f32 values: 0.2, 1.0, -0.3, 24.0, ...) | all 3 |
+| +0x10 | pointer to one u64 per texture slot (0 = unbound) | all 3 |
+| +0x20 | pointer to the parameter table | all 3 |
+| +0x30 | `00 80 78 01 01 ff 00 00` | all 3 |
+
+Parameter table (jaw at 0x40): `+0x01 u8` texture parameters (6), `+0x04 u8`
+parameters in total (0x39 = 57), then from +0x08 one `{u32 name hash, u32
+packed}` pair per parameter, textures first. For a texture the packed word is
+`slot << 2` (0, 4, ... 0x14: slots 0..5); for the 51 constants its low two
+bits are 3 and the upper bits look like a word offset and a vector count
+(not decoded). The texture parameter names are joaat hashes, matched with
+`forge9 hash`:
+
+| Hash | Name | Slot | Bound in all 3 |
+|------|------|-----:|:--------------:|
+| 0xc8e8c282 | `diffusetex` | 0 | yes |
+| 0x739e3d0d | `speculartex2` | 1 | yes |
+| 0x2c8d7182 | `tintpalettetex` | 2 | no |
+| 0x0cd27763 | (not found) | 3 | no |
+| 0xc6f46e79 | `speculartex` | 4 | yes |
+| 0x1e77bf4c | `bumptex` | 5 | yes |
+
+Texture reference (80 bytes, jaw slot 0 at 0x1300): +0x10 u32 0x980, +0x30
+pointer to a 16-byte name record, +0x3c `u16 1, u16 1`, +0x40 `ff 00 01 00
+00 00 01 00`; no width, height, format or graphics pointer, so the texels are
+external. Name record (0x1d90): `+0x00` a pointer with low bits 5 (0x50001d85)
+to `{u64 6, u32 name hash}` 16 bytes earlier, `+0x08` a u64 key. All three
+shaders bind the same four textures:
+
+| Parameter | Name hash | Key |
+|-----------|-----------|-----|
+| `diffusetex` | 0x0d601c9a | 75a4cddb894939a6 |
+| `speculartex2` | 0x5d4a8a97 | f790e14cb486206c |
+| `speculartex` | 0xd3c59b35 | 53bd159e0279ee67 |
+| `bumptex` | 0x6dc85865 | 3ca737af680d8a96 |
+
+### Texture resolution
+
+`model` looks each key up in the 64-bit hash of every ETPF descriptor of the
+`.ttpf` stores (`--textures`, default every `.ttpf` next to the archive),
+then embeds `diffusetex` as `baseColorTexture` and `bumptex` as
+`normalTexture` (PNG, mip 0; BC5 gets Z rebuilt as `sqrt(1 - x^2 - y^2)`).
+Materials set `metallicFactor` 0; other textures are reported, not mapped.
+
+Locally, 0 of the 12 references resolve: none of the four keys, either
+32-bit half, or the name hashes occurs in `platform.ttpf`,
+`ttdb_graphics.ttpf` or `ttdb_props.ttpf` (1124 textures), anywhere else in
+those files, or in any inflated entry of the story, common or script packs
+besides the dictionary itself. The ttdb_props textures that look like gore
+(a flesh atlas, a skull-like face) do not fit the skulls' UV layouts. So the
+key-to-store mapping is the working assumption, not yet confirmed on a
+sample: the gore textures live in a store that is not present.
+
+With store textures forced in place of the keys, the output passes the
+Khronos glTF validator with 0 errors (warning: no TANGENT, since normal
+bits 20..31 are not decoded); the untextured export has 0 errors and 0
+warnings.
 
 ## Header false positives in the particle effect list (`20/0`)
 
@@ -239,5 +326,7 @@ to be validated.
 
 Not validated (no local sample): standalone drawables, LODs 1..3, the
 float3 (99) position path, float2 texcoords, fragments, skinned meshes.
-Not decoded: normal bits 20..31 (likely tangent frame), vertex colors
-(semantic 24), the +0xB0 lists, the geometry OBB, materials.
+Not decoded: normal bits 20..31 (likely tangent frame), the meaning of
+semantic 24, the +0xB0 lists, the geometry OBB, shader constants, embedded
+texture dictionaries (no sample), the texture reference fields besides the
+name record.

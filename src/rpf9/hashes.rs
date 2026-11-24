@@ -26,6 +26,9 @@ const KNOWN: &[(u32, &str)] = &[
     (0xa26a72dd, "textures"), (0xe7a8cdf1, "script"), (0xb80c6ae8, "audio"),
     (0x20ef298e, "movies"), (0x0e5d52e0, "packs"), (0x275b8a30, "levels"),
     (0x0a802776, "anim"), (0x2eb2ee6e, "navmeshes"),
+    // Shader texture parameters
+    (0xc8e8c282, "diffusetex"), (0x1e77bf4c, "bumptex"), (0xc6f46e79, "speculartex"),
+    (0x739e3d0d, "speculartex2"), (0x2c8d7182, "tintpalettetex"),
 ];
 
 pub fn joaat(name: &str) -> u32 {
