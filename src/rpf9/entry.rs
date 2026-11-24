@@ -40,7 +40,7 @@ pub fn has_graph_magic(plain: &[u8]) -> bool {
 /// Two layouts share the 24-byte stride:
 /// - indexed (most archives): `{u32 size_hint, 0, u32 offset/16, u32 flags, u32 aux, 0}`
 /// - stored (e.g. script.rpf, whose entries are nested RPF9s):
-///   `{u64 offset/16, u64 ceil(size/16), u64 size}` — the middle field is a
+///   `{u64 offset/16, u64 ceil(size/16), u64 size}`: the middle field is a
 ///   built-in check that the indexed layout never satisfies once flags are set.
 fn decode(bytes: &[u8]) -> Option<(u64, Option<u64>)> {
     if bytes.len() < RECORD { return None; }

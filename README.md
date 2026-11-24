@@ -2,7 +2,7 @@
 
 General-purpose toolkit for RPF9 archives. Read, decrypt, inspect, extract and analyze.
 
-RPF9 is a container format used by a well-known retail game engine. This tool handles decryption, TOC parsing, entry listing, content extraction, and format detection — a foundation for research, interoperability work and asset tooling.
+RPF9 is a container format used by a well-known retail game engine. This tool handles decryption, TOC parsing, entry listing, content extraction, and format detection: a foundation for research, interoperability work and asset tooling.
 
 ## Features
 
@@ -178,7 +178,7 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
 | Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
 | Drawable (model) | (paged, no magic) | `model` | Standalone drawables and drawable dictionaries: LOD groups → models → geometries; positions in formats 66 (quantized) and 99 (float3), octahedral 10:10 normals, two float2/snorm16 UV sets, clustered meshlet indices; to glTF/OBJ; shader group texture references resolved against `.ttpf` stores into glTF materials. Tangents, skinning and fragments not yet decoded. Checked on a real drawable dictionary (format 66 path); the float3 path only on a synthetic drawable |
-| RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; mip 0 to DDS/PNG: BCPack BC1 (fitted tables — endpoints approximate), BCPack BC3/BC5/BC7 and plain BC3/BC5/BC7 (tile modes 0-3) |
+| RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; mip 0 to DDS/PNG: BCPack BC1 (fitted tables, endpoints approximate), BCPack BC3/BC5/BC7 and plain BC3/BC5/BC7 (tile modes 0-3) |
 | XML, DDS, PNG, GFX, RBF | various | `list` | Detected only |
 
 ## Architecture
@@ -217,8 +217,8 @@ Adding a format is one file in `src/formats/` plus a subcommand; see [CONTRIBUTI
 
 The decryption tables and key schedules must be provided externally in a `data/` directory (or set via `--data-dir` / `FORGE9_DATA` env var):
 
-- `tables.bin` — 20,480 bytes: 16 permuted S-boxes + 16 T-tables
-- `keys.bin` — 39,060 bytes: 9 expanded key schedules
+- `tables.bin` (20,480 bytes): 16 permuted S-boxes + 16 T-tables
+- `keys.bin` (39,060 bytes): 9 expanded key schedules
 
 These files are **not included** in this repository. They must be extracted from the target runtime by the user from their own legally obtained copy.
 

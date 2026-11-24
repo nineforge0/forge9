@@ -1,4 +1,4 @@
-//! RPF9 T-table block cipher — decrypt and encrypt.
+//! RPF9 T-table block cipher: decrypt and encrypt.
 //!
 //! The cipher uses permuted S-boxes and T-tables extracted from the
 //! runtime of a well-known retail title. It runs 13 rounds (14 round

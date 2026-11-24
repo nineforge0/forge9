@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Forge9 ecosystem monitor — tracks MERGED PRs and significant activity.
+# Forge9 ecosystem monitor: tracks MERGED PRs and significant activity.
 # Zero AI tokens: pure gh CLI + jq/python3 diffing.
 set -euo pipefail
 

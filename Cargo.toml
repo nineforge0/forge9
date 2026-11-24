@@ -2,7 +2,7 @@
 name = "forge9"
 version = "0.1.0"
 edition = "2024"
-description = "General-purpose toolkit for RPF9 archives — read, decrypt, inspect, extract and analyze"
+description = "General-purpose toolkit for RPF9 archives: read, decrypt, inspect, extract and analyze"
 license = "MIT"
 repository = "https://github.com/nineforge0/forge9"
 readme = "README.md"

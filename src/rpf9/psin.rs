@@ -1,4 +1,4 @@
-//! PSIN (PSO v122) parser — compiled game data (binary-XML DOM).
+//! PSIN (PSO v122) parser: compiled game data (binary-XML DOM).
 //!
 //! PSIN containers hold game configuration: vehicle handling, weapons,
 //! AI behavior, spawn rules, etc. The format is an IFF-chunk chain:

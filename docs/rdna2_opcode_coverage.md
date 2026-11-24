@@ -225,7 +225,7 @@ GPU still executes in opcode slots GFX10.3 leaves unassigned:
 entry 0 (and the 182 in entry 2) has a name. The decoder would label an
 unassigned opcode `VOP3_op0x1a7`-style rather than drop it.
 
-**One real ambiguity — VOP3 0x140** (24,717 in 6,058 programs): GFX10.3 names
+**One real ambiguity: VOP3 0x140** (24,717 in 6,058 programs): GFX10.3 names
 it `v_fma_legacy_f32` (fused), GFX10.1 `v_mad_legacy_f32` (not fused). Since the
 console GPU demonstrably keeps the other GFX10.1 non-fused multiply-adds, the
 non-fused GFX10.1 meaning is the likelier one; forge9 prints the GFX10.3 name.

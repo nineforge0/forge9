@@ -3,7 +3,7 @@
 **/*.exe
 **/*.pdb
 
-# Game data and crypto material — never committed
+# Game data and crypto material: never committed
 /bin/
 /data/*.bin
 *.rpf

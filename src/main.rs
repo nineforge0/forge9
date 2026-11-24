@@ -327,7 +327,7 @@ fn main() -> Result<()> {
         return cmd_bcpack_analyze(store, *chunk, codec.as_deref(), output.as_deref(), widths.as_deref());
     }
     let crypto = rpf9::crypto::CryptoContext::load(&cli.data_dir)
-        .context("loading crypto data — set FORGE9_DATA or --data-dir")?;
+        .context("loading crypto data: set FORGE9_DATA or --data-dir")?;
 
     match cli.command {
         Command::Info { archive } => cmd_info(&archive, &crypto),
@@ -700,7 +700,7 @@ fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, 
 
     // Check if it's a nested RPF9 containing PSIN
     if bytes.starts_with(b"9FPR") {
-        println!("entry #{index} is a nested RPF9 — scanning for PSIN inside...");
+        println!("entry #{index} is a nested RPF9: scanning for PSIN inside...");
         let nested = rpf9::reader::Archive::open(&bytes, crypto)?;
         let mut found = 0;
         for ne in nested.entries() {
@@ -823,7 +823,7 @@ fn load_entry_blocks(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index
 
 fn cmd_awc(bytes: &[u8]) -> Result<()> {
     let awc = formats::awc::parse(bytes)?;
-    println!("AWC v{} flags {:#06x} header {:#x} — {} streams", awc.version, awc.flags, awc.header_size, awc.streams.len());
+    println!("AWC v{} flags {:#06x} header {:#x}: {} streams", awc.version, awc.flags, awc.header_size, awc.streams.len());
     for s in &awc.streams {
         let fmt = match s.format {
             Some(f) => {
@@ -1191,7 +1191,7 @@ fn cmd_isa(bytes: &[u8], summary: bool, shader: Option<usize>, heavy: Option<usi
     use std::collections::BTreeMap;
     let records = formats::sgd5::parse(bytes)?;
     if let Some(n) = heavy {
-        // Rank programs by instruction count — the heaviest drive DXC/driver compile cost.
+        // Rank programs by instruction count: the heaviest drive DXC/driver compile cost.
         let mut all: Vec<(u32, &str, bool, String)> = Vec::new();
         for rec in &records {
             if let Ok(progs) = record_isa(bytes, rec) {

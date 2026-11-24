@@ -28,7 +28,7 @@ pub fn verify(m: &Manifest, archive: Option<&Path>, crypto: Option<&CryptoContex
     let opened = match (&raw, crypto) {
         (Some(raw), Some(c)) => Some(Archive::open(raw, c)?),
         _ => {
-            println!("  (archive or crypto unavailable — checking files only)");
+            println!("  (archive or crypto unavailable: checking files only)");
             None
         }
     };

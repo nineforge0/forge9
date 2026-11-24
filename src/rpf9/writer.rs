@@ -1,4 +1,4 @@
-//! RPF9 archive writer — in-place replacement and full repack.
+//! RPF9 archive writer: in-place replacement and full repack.
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use crate::rpf9::reader::Archive;
 
 /// Replace a single entry's payload in-place (same size only).
 /// Writes a new archive file with the payload bytes swapped.
-/// The encrypted TOC stays untouched — no encrypt needed.
+/// The encrypted TOC stays untouched: no encrypt needed.
 pub fn replace_inplace(
     original: &[u8],
     crypto: &CryptoContext,
@@ -65,7 +65,7 @@ pub fn replace_zlib_inplace(
         .ok_or_else(|| anyhow::anyhow!("entry index {entry_index} out of range"))?;
 
     if !entry.is_zlib(original) {
-        bail!("entry #{entry_index} is not zlib — use replace_inplace for raw entries");
+        bail!("entry #{entry_index} is not zlib: use replace_inplace for raw entries");
     }
 
     let start = entry.offset as usize;
@@ -124,7 +124,7 @@ pub fn repack(
 
     for (&idx, data) in replacements {
         if data.is_empty() {
-            bail!("replacement for entry #{idx} is empty (0 bytes) — this would produce an unreadable record");
+            bail!("replacement for entry #{idx} is empty (0 bytes): this would produce an unreadable record");
         }
     }
 
@@ -167,7 +167,7 @@ pub fn repack(
         &toc_plain, archive_total, header.entry_count as usize,
     );
     if run < entries.len() {
-        bail!("TOC layout has no 24-byte entry records to rewrite (compact content archive?) — repack unsupported");
+        bail!("TOC layout has no 24-byte entry records to rewrite (compact content archive?): repack unsupported");
     }
     let skip = if header.entry_count > 0 && run == header.entry_count as usize + 1 { 1 } else { 0 };
 

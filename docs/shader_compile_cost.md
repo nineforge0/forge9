@@ -45,9 +45,9 @@ Top 10 by instruction count:
 
 Three shader families account for nearly all of the >20k-instruction programs:
 
-- `indirect_diffuse_lighting:CS_ScreenProbes_*` — the screen-probe GI trace/activate passes (the 70k–90k ones).
-- `rtdirectionalshadows:CS_RTShadowTrace32*` — RT directional shadows, ~14 HQ/temporal/RPP variants from 10k to 47k instructions each.
-- `*:CS_RaytracingResolve` and `shadowmask:CS_TraceShadowRays_*` — material RT resolve and shadow-ray passes.
+- `indirect_diffuse_lighting:CS_ScreenProbes_*`: the screen-probe GI trace/activate passes (the 70k–90k ones).
+- `rtdirectionalshadows:CS_RTShadowTrace32*`: RT directional shadows, ~14 HQ/temporal/RPP variants from 10k to 47k instructions each.
+- `*:CS_RaytracingResolve` and `shadowmask:CS_TraceShadowRays_*`: material RT resolve and shadow-ray passes.
 
 ## Why this helps the watchdog problem
 
