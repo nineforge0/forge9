@@ -42,20 +42,46 @@ pub fn codec_name(codec: u8) -> &'static str {
 /// or PNG when `png`; also returns the number of blocks bcpack-rs flags as
 /// depending on undetermined table values (0 = exact).
 pub fn export(store: &Store, tex: &Texture, png: bool, slice: u32) -> Result<(Vec<u8>, usize)> {
-    if matches!(tex.dxgi, 76..=78 | 82..=84 | 97..=99) {
-        return export_16b(store, tex, png, slice);
+    let (blocks, unfitted) = mip0_blocks(store, tex, slice)?;
+    let bytes = match (png, is_16b(tex)) {
+        (true, _) => bcpack::ttpf::png_rgba(&to_rgba(&blocks, tex), tex.width, tex.height)?,
+        (false, true) => dds_dx10(&blocks, tex.width, tex.height, tex.dxgi),
+        (false, false) => bcpack::ttpf::dds_bc1(&blocks, tex.width, tex.height),
+    };
+    Ok((bytes, unfitted))
+}
+
+/// Mip 0 of slice 0 as PNG for a glTF material; BC5 (two-channel normal map) gets Z rebuilt into blue.
+pub fn material_png(store: &Store, tex: &Texture) -> Result<Vec<u8>> {
+    let mut px = to_rgba(&mip0_blocks(store, tex, 0)?.0, tex);
+    if matches!(tex.dxgi, 82..=84) { rebuild_z(&mut px); }
+    Ok(bcpack::ttpf::png_rgba(&px, tex.width, tex.height)?)
+}
+
+fn rebuild_z(rgba: &mut [u8]) {
+    for p in rgba.chunks_exact_mut(4) {
+        let [x, y] = [p[0], p[1]].map(|c| f32::from(c) / 127.5 - 1.0);
+        p[2] = (((1.0 - x * x - y * y).max(0.0).sqrt() + 1.0) * 127.5).round() as u8;
+    }
+}
+
+fn is_16b(tex: &Texture) -> bool { matches!(tex.dxgi, 76..=78 | 82..=84 | 97..=99) }
+
+fn to_rgba(blocks: &[u8], tex: &Texture) -> Vec<u8> {
+    let (bw, bh, w, h) = (tex.width.div_ceil(4) as usize, tex.height.div_ceil(4) as usize, tex.width as usize, tex.height as usize);
+    if is_16b(tex) { bc16_to_rgba(blocks, tex.dxgi, bw, w, h) } else { bcpack::ttpf::bc1_to_rgba(blocks, bw, bh, w, h) }
+}
+
+/// Row-major mip 0 blocks of slice `slice` and bcpack-rs's unfitted block count.
+fn mip0_blocks(store: &Store, tex: &Texture, slice: u32) -> Result<(Vec<u8>, usize)> {
+    if is_16b(tex) {
+        return blocks_16b(store, tex, slice);
     }
     anyhow::ensure!(slice == 0, "texture {}: slices are only supported for BC3/BC5/BC7", tex.index);
     let window = bcpack::bc1::Window::default_table();
     let quads = bcpack::bc1::QuadTable::default_table();
     let m = bcpack::texture_mip0(store, tex, &window, &quads).with_context(|| format!("texture {}", tex.index))?;
-    let bytes = if png {
-        let rgba = bcpack::ttpf::bc1_to_rgba(&m.blocks, m.bw, m.bh, m.width as usize, m.height as usize);
-        bcpack::ttpf::png_rgba(&rgba, m.width, m.height)?
-    } else {
-        bcpack::ttpf::dds_bc1(&m.blocks, m.width, m.height)
-    };
-    Ok((bytes, m.unfitted_blocks))
+    Ok((m.blocks, m.unfitted_blocks))
 }
 
 /// Gfx10 swizzle of 16-byte elements, lowest address bit first: a 4x4-element
@@ -94,7 +120,7 @@ fn mip0_place_16b(tile_mode: u32, w: u32, h: u32, mips: u32, slices: u32, slice:
     (n * before + s * len(0), len(0), ew.div_ceil(bw) * bw, eh.div_ceil(bh) * bh, 0, 0)
 }
 
-fn export_16b(store: &Store, tex: &Texture, png: bool, slice: u32) -> Result<(Vec<u8>, usize)> {
+fn blocks_16b(store: &Store, tex: &Texture, slice: u32) -> Result<(Vec<u8>, usize)> {
     anyhow::ensure!(tex.tile_mode <= 3, "texture {}: tile mode {} not supported", tex.index, tex.tile_mode);
     anyhow::ensure!(slice < tex.array_size, "texture {}: slice {slice} out of range ({} slices)", tex.index, tex.array_size);
     let (off, len, rw, rh, ox, oy) = mip0_place_16b(tex.tile_mode, tex.width, tex.height, tex.mips, tex.array_size, slice);
@@ -128,13 +154,7 @@ fn export_16b(store: &Store, tex: &Texture, png: bool, slice: u32) -> Result<(Ve
     }
     let (bw, bh) = (tex.width.div_ceil(4) as usize, tex.height.div_ceil(4) as usize);
     let blocks: Vec<u8> = (0..bh).flat_map(|y| lin[((y + oy as usize) * rw + ox as usize) * 16..][..bw * 16].iter().copied()).collect();
-    let bytes = if png {
-        let rgba = bc16_to_rgba(&blocks, tex.dxgi, bw, tex.width as usize, tex.height as usize);
-        bcpack::ttpf::png_rgba(&rgba, tex.width, tex.height)?
-    } else {
-        dds_dx10(&blocks, tex.width, tex.height, tex.dxgi)
-    };
-    Ok((bytes, unfitted))
+    Ok((blocks, unfitted))
 }
 
 /// Row-major BC3/BC5/BC7 blocks -> RGBA8 (BC5 as R, G, 0, 255).
@@ -251,6 +271,10 @@ mod tests {
         let rgba = bc16_to_rgba(&chunk[..16], 83, 1, 3, 2);
         assert_eq!(rgba, [255, 0, 0, 255].repeat(6));
         assert!(export(&store, t, false, 1).is_err());
+        let mut px = [255, 128, 0, 255, 128, 128, 0, 255];
+        rebuild_z(&mut px);
+        assert_eq!(px, [255, 128, 128, 255, 128, 128, 255, 255]);
+        assert_eq!(&material_png(&store, t).unwrap()[1..4], b"PNG");
     }
 
     #[test]

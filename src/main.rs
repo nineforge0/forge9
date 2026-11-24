@@ -207,6 +207,9 @@ enum Command {
         /// LOD to export, 0 = highest detail
         #[arg(long, default_value_t = 0)]
         lod: usize,
+        /// Texture stores to resolve material textures in (default: every .ttpf next to the archive)
+        #[arg(long, num_args = 1..)]
+        textures: Vec<PathBuf>,
     },
     /// List textures in an RDS5 (.ttpf) store, or export one BC1/BC3/BC5/BC7 texture's mip 0
     Texture {
@@ -329,7 +332,16 @@ fn main() -> Result<()> {
         Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
-        Command::Model { archive, index, output, obj, lod } => cmd_model(&load_entry_blocks(&archive, &crypto, &index)?, output, obj, lod),
+        Command::Model { archive, index, output, obj, lod, textures } => {
+            let textures = if !textures.is_empty() { textures } else {
+                let dir = archive.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+                let mut found: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|e| Some(e.ok()?.path()))
+                    .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ttpf"))).collect();
+                found.sort();
+                found
+            };
+            cmd_model(&load_entry_blocks(&archive, &crypto, &index)?, output, obj, lod, &textures, &dict)
+        }
         Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
             let m = modding::manifest::Manifest::load(&manifest)?;
             modding::apply::apply(&m, archive.as_deref(), &crypto, &output)
@@ -717,10 +729,40 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize) -> Result<()> {
-    use formats::drawable;
-    let d = drawable::parse_blocks(blocks, lod)?;
+fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize, stores: &[PathBuf], dict: &rpf9::hashes::Dict) -> Result<()> {
+    use formats::{drawable, texture};
+    let mut d = drawable::parse_blocks(blocks, lod)?;
     for s in &d.skipped { eprintln!("  skipped {s}"); }
+    let mut opened = Vec::new();
+    for path in stores {
+        let store = texture::Store::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let texs = store.textures()?;
+        opened.push((path.file_name().unwrap_or_default().to_string_lossy().into_owned(), store, texs));
+    }
+    let total: usize = opened.iter().map(|(_, _, t)| t.len()).sum();
+    let mut resolved = 0;
+    for m in &mut d.materials {
+        println!("  material {} (shader {:#010x}): {} textures", m.name, m.shader, m.textures.len());
+        for t in &m.textures {
+            let hit = opened.iter().find_map(|(name, store, texs)| texs.iter().find(|x| x.hash == t.key).map(|x| (name, store, x)));
+            let what = match hit {
+                None => format!("not in {} stores ({total} textures)", opened.len()),
+                Some((name, store, tex)) => {
+                    resolved += 1;
+                    let slot = match t.param { drawable::DIFFUSE_PARAM => Some(&mut m.base_color), drawable::BUMP_PARAM => Some(&mut m.normal), _ => None };
+                    let used = match slot.map(|s| texture::material_png(store, tex).map(|png| *s = Some(png))) {
+                        None => String::new(),
+                        Some(Ok(())) => ", embedded".into(),
+                        Some(Err(e)) => format!(", not decoded: {e:#}"),
+                    };
+                    format!("{name} #{} {}x{} {}{used}", tex.index, tex.width, tex.height, texture::dxgi_name(tex.dxgi))
+                }
+            };
+            println!("    {} name {:#010x} key {:016x}: {what}", dict.fmt(t.param), t.name_hash, t.key);
+        }
+    }
+    let refs: usize = d.materials.iter().map(|m| m.textures.len()).sum();
+    if refs > 0 { println!("  {resolved} of {refs} texture references resolved"); }
     let out = match obj {
         Some(path) => { std::fs::write(&path, drawable::to_obj(&d))?; path }
         None => {
@@ -740,8 +782,9 @@ fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, 
     let tris: usize = d.meshes.iter().map(|m| m.indices.len() / 3).sum();
     let uv = d.meshes.iter().filter(|m| m.uvs.is_some()).count();
     let normals = d.meshes.iter().filter(|m| m.normals.is_some()).count();
-    println!("{} LOD{}: {} meshes ({normals} with normals, {uv} with UVs), {verts} vertices, {tris} triangles, {} skipped → {}",
-        d.name, d.lod, d.meshes.len(), d.skipped.len(), out.display());
+    let colors = d.meshes.iter().filter(|m| m.colors.is_some()).count();
+    println!("{} LOD{}: {} meshes ({normals} with normals, {uv} with UVs, {colors} with colors), {} materials, {verts} vertices, {tris} triangles, {} skipped → {}",
+        d.name, d.lod, d.meshes.len(), d.materials.len(), d.skipped.len(), out.display());
     for m in &d.meshes {
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
         for p in &m.positions { for k in 0..3 { min[k] = min[k].min(p[k]); max[k] = max[k].max(p[k]); } }
