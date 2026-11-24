@@ -100,6 +100,9 @@ enum Command {
         /// Byte string to find in inflated content (slow)
         #[arg(long)]
         grep: Option<String>,
+        /// Only entries that `model` can export, with their mesh counts per LOD (slow)
+        #[arg(long)]
+        drawable: bool,
     },
     /// Compute the joaat hash of a name
     Hash { name: String },
@@ -308,8 +311,8 @@ fn main() -> Result<()> {
         Command::Psin { archive, index, structs, limit } => cmd_psin(&archive, &crypto, index, structs, limit, &dict),
         Command::Tree { archive, depth } => cmd_tree(&archive, &crypto, depth),
         Command::Repack { archive, patch, output } => cmd_repack(&archive, &crypto, &patch, &output),
-        Command::Search { archive, magic, ext, min_size, grep } => {
-            let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep: grep.map(String::into_bytes) };
+        Command::Search { archive, magic, ext, min_size, grep, drawable } => {
+            let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep: grep.map(String::into_bytes), drawable };
             let raw = std::fs::read(&archive)?;
             let hits = search(&raw, &archive.display().to_string(), &crypto, &filter)?;
             println!("{hits} matches");
@@ -504,6 +507,7 @@ struct SearchFilter {
     ext: Option<String>,
     min_size: Option<u64>,
     grep: Option<Vec<u8>>,
+    drawable: bool,
 }
 
 /// Prints matching entries as `label#index`, descending into nested RPF9s; returns the match count.
@@ -516,16 +520,23 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
         let matches = f.min_size.is_none_or(|m| entry.size >= m)
             && f.ext.as_deref().is_none_or(|e| e.trim_start_matches('.') == ext)
             && f.magic.as_deref().is_none_or(|m| archive.head(entry, m.len()) == m);
-        // Content is only inflated when needed: for grep, or to recurse.
-        let bytes = if (matches && f.grep.is_some()) || ext == "rpf" { archive.read_entry(entry).ok() } else { None };
+        // Content is only inflated when needed: for grep or drawable, or to recurse.
+        let blocks = if (matches && (f.grep.is_some() || f.drawable)) || ext == "rpf" { archive.read_entry_blocks(entry).ok() } else { None };
+        let bytes = blocks.as_deref().map(<[Vec<u8>]>::concat);
         let grep_ok = match (&f.grep, &bytes) {
             (None, _) => true,
             (Some(g), Some(b)) => !g.is_empty() && b.windows(g.len()).any(|w| w == g.as_slice()),
             (Some(_), None) => false,
         };
-        if matches && grep_ok {
+        let lods: Vec<String> = match (&blocks, f.drawable && ext != "rpf") {
+            (Some(b), true) => (0..formats::drawable::LOD_COUNT)
+                .filter_map(|lod| formats::drawable::parse_blocks(b, lod).ok().map(|d| format!(" LOD{lod}: {} meshes", d.meshes.len())))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if matches && grep_ok && (!f.drawable || !lods.is_empty()) {
             hits += 1;
-            println!("  {path:<24} {:#010x} {:>10} bytes .{ext}", entry.offset, entry.size);
+            println!("  {path:<24} {:#010x} {:>10} bytes .{ext}{}", entry.offset, entry.size, lods.concat());
         }
         if ext == "rpf" {
             if let Some(b) = &bytes {
@@ -728,7 +739,8 @@ fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, 
     let verts: usize = d.meshes.iter().map(|m| m.positions.len()).sum();
     let tris: usize = d.meshes.iter().map(|m| m.indices.len() / 3).sum();
     let uv = d.meshes.iter().filter(|m| m.uvs.is_some()).count();
-    println!("{} LOD{}: {} meshes ({uv} with UVs), {verts} vertices, {tris} triangles, {} skipped → {}",
+    let normals = d.meshes.iter().filter(|m| m.normals.is_some()).count();
+    println!("{} LOD{}: {} meshes ({normals} with normals, {uv} with UVs), {verts} vertices, {tris} triangles, {} skipped → {}",
         d.name, d.lod, d.meshes.len(), d.skipped.len(), out.display());
     for m in &d.meshes {
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
