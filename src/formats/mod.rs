@@ -11,6 +11,7 @@ pub mod rdna2_disasm;
 mod rdna2_operands;
 mod rdna2_ops;
 pub mod resource;
+pub mod rt_census;
 pub mod sgd5;
 pub mod texture;
 pub mod uniformity;

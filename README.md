@@ -93,6 +93,7 @@ forge9 isa shaders.rpf 0 --summary         # programs using each op, by stage
 forge9 isa shaders.rpf 0 --shader 594      # full family breakdown of one record
 forge9 isa shaders.rpf 0 --opcodes         # opcode census (add --stage MS for one stage)
 forge9 isa shaders.rpf 0 --uniformity      # EXEC-uniform (guard-foldable) share, per stage and for the 30 heaviest
+forge9 isa shaders.rpf 0 --rt-census       # BVH intersect sites, traversal-loop shapes and loop share (--json too)
 forge9 isa shaders.rpf 0 --shader 594 --dump out  # raw code → out.<n>.<stage>.bin
 
 # Full disassembly of one record's programs, LLVM (llvm-mc -mcpu=gfx1030) syntax;
@@ -173,7 +174,7 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 | AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
 | SGD5 shader database | `SGD5` | `shaders` | Record names, stages, tags, sizes; DXBC payload offsets |
 | Xbox shader program | `XBCH` → `FSSM` | `fssm` | XDAT section 0x0D inflated; stages, root layout, used resources |
-| RDNA2 machine code | (FSSM code range) | `isa`, `disasm` | Length decode by control flow, encoding families, opcodes, wave64-sensitive ops, EXEC-uniformity (DXIL-fold headroom); full disassembly with operands (matches llvm-mc on a 3.47M-instruction sample); see [docs/wave64_instruction_usage.md](docs/wave64_instruction_usage.md), [docs/rdna2_opcode_coverage.md](docs/rdna2_opcode_coverage.md), [docs/exec_uniformity.md](docs/exec_uniformity.md) |
+| RDNA2 machine code | (FSSM code range) | `isa`, `disasm` | Length decode by control flow, encoding families, opcodes, wave64-sensitive ops, EXEC-uniformity (DXIL-fold headroom), ray-traversal census; full disassembly with operands (matches llvm-mc on a 3.47M-instruction sample); see [docs/wave64_instruction_usage.md](docs/wave64_instruction_usage.md), [docs/rdna2_opcode_coverage.md](docs/rdna2_opcode_coverage.md), [docs/exec_uniformity.md](docs/exec_uniformity.md), [docs/rt_traversal_census.md](docs/rt_traversal_census.md) |
 | Pipeline cache | `PS 00 09` | `pipelines` | Header, graphics/compute PSO records, shader slots, metadata and code ranges |
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
 | Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
