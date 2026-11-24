@@ -1,0 +1,343 @@
+mod rpf9;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "forge9", version, about = "General-purpose RPF9 archive toolkit")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+
+    /// Path to directory containing tables.bin and keys.bin
+    #[arg(long, env = "FORGE9_DATA", default_value = "data")]
+    data_dir: PathBuf,
+
+    /// Extra hash dictionary: one `hexhash name` per line
+    #[arg(long, global = true, env = "FORGE9_DICT")]
+    dict: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Show archive header and summary
+    Info { archive: PathBuf },
+    /// List all entries in the archive
+    List {
+        archive: PathBuf,
+        #[arg(long, default_value_t = usize::MAX)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Extract entries to a directory
+    Extract {
+        archive: PathBuf,
+        #[arg(short, long, default_value = "out")]
+        output: PathBuf,
+        #[arg(long)]
+        select: Option<String>,
+    },
+    /// Hex dump a single entry
+    Hexdump {
+        archive: PathBuf,
+        index: usize,
+        #[arg(long, default_value_t = 512)]
+        limit: usize,
+    },
+    /// Replace an entry's payload in-place (same size)
+    Replace {
+        archive: PathBuf,
+        /// Entry index to replace
+        index: usize,
+        /// File with replacement bytes
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Output archive path
+        #[arg(short, long, default_value = "out.rpf")]
+        output: PathBuf,
+    },
+    /// Inspect PSIN game data in an entry
+    Psin {
+        archive: PathBuf,
+        /// Entry index containing PSIN data
+        index: usize,
+        /// Show struct definitions
+        #[arg(long)]
+        structs: bool,
+        /// Max structs to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Recursively list nested RPF9 archives
+    Tree {
+        archive: PathBuf,
+        /// Max depth
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
+    /// Repack archive with replaced entries (any size)
+    Repack {
+        archive: PathBuf,
+        /// Replacements as index=file pairs (e.g. 0=new.bin,2=other.dat)
+        #[arg(short, long, value_delimiter = ',')]
+        patch: Vec<String>,
+        /// Output archive path
+        #[arg(short, long, default_value = "repacked.rpf")]
+        output: PathBuf,
+    },
+    /// Find entries (recursing into nested RPF9s) matching all given filters
+    Search {
+        archive: PathBuf,
+        /// Leading content bytes, e.g. PSIN
+        #[arg(long)]
+        magic: Option<String>,
+        /// Detected extension, e.g. xml
+        #[arg(long)]
+        ext: Option<String>,
+        #[arg(long)]
+        min_size: Option<u64>,
+        /// Byte string to find in inflated content (slow)
+        #[arg(long)]
+        grep: Option<String>,
+    },
+    /// Compute the joaat hash of a name
+    Hash { name: String },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let dict = rpf9::hashes::Dict::load(cli.dict.as_deref())?;
+    if let Command::Hash { name } = &cli.command {
+        let h = rpf9::hashes::joaat(name);
+        println!("{h:#010x}  {name}");
+        if let Some(known) = dict.name(h).filter(|k| k != name) { println!("  (dictionary: {known})"); }
+        return Ok(());
+    }
+    let crypto = rpf9::crypto::CryptoContext::load(&cli.data_dir)
+        .context("loading crypto data — set FORGE9_DATA or --data-dir")?;
+
+    match cli.command {
+        Command::Info { archive } => cmd_info(&archive, &crypto),
+        Command::List { archive, limit, json } => cmd_list(&archive, &crypto, limit, json),
+        Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
+        Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
+        Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
+        Command::Psin { archive, index, structs, limit } => cmd_psin(&archive, &crypto, index, structs, limit, &dict),
+        Command::Tree { archive, depth } => cmd_tree(&archive, &crypto, depth),
+        Command::Repack { archive, patch, output } => cmd_repack(&archive, &crypto, &patch, &output),
+        Command::Search { archive, magic, ext, min_size, grep } => {
+            let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep: grep.map(String::into_bytes) };
+            let raw = std::fs::read(&archive)?;
+            let hits = search(&raw, &archive.display().to_string(), &crypto, &filter)?;
+            println!("{hits} matches");
+            Ok(())
+        }
+        Command::Hash { .. } => unreachable!(),
+    }
+}
+
+fn cmd_info(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
+    let h = archive.header();
+    println!("{} ({} bytes)", path.display(), raw.len());
+    println!("  version {}.{} gen {:#x} key #{}", h.version_high, h.version_low, h.generation(), archive.key_index());
+    println!("  entries {} payload {:#x} split {:#x} trailer {:#x}", h.entry_count, h.payload_start, h.split, h.trailer_size);
+    println!("  key_id {:#x} flags {:#x} stride {}", h.key_id, h.flags, h.entry_stride());
+    let zlib = archive.entries().iter().filter(|e| e.is_zlib(&raw)).count();
+    println!("  {} entries ({} zlib, {} raw)", archive.entries().len(), zlib, archive.entries().len() - zlib);
+    Ok(())
+}
+
+fn cmd_list(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, limit: usize, json: bool) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
+    if json {
+        println!("[");
+        let total = archive.entries().len().min(limit);
+        for (i, entry) in archive.entries().iter().take(limit).enumerate() {
+            let comma = if i + 1 >= total { "" } else { "," };
+            let ext = archive.sniff(entry);
+            println!("  {{\"index\":{},\"offset\":{},\"size\":{},\"flags\":{},\"ext\":\"{ext}\"}}{comma}", entry.index, entry.offset, entry.size, entry.flags);
+        }
+        println!("]");
+    } else {
+        for entry in archive.entries().iter().take(limit) {
+            let ext = archive.sniff(entry);
+            let zlib = if entry.is_zlib(&raw) { " zlib" } else { "" };
+            println!("  #{:<4} {:#010x}  {:>10} bytes  .{ext}{zlib}", entry.index, entry.offset, entry.size);
+        }
+        if archive.entries().len() > limit {
+            println!("  … {} more", archive.entries().len() - limit);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_extract(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, output: &PathBuf, select: Option<String>) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
+    std::fs::create_dir_all(output)?;
+    let indices: Option<Vec<usize>> = select.map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect());
+    let mut written = 0;
+    for entry in archive.entries() {
+        if let Some(ref idx) = indices {
+            if !idx.contains(&entry.index) { continue; }
+        }
+        let bytes = archive.read_entry(entry)?;
+        let ext = rpf9::reader::sniff_ext(&bytes);
+        std::fs::write(output.join(format!("{:08x}.{ext}", entry.offset)), &bytes)?;
+        written += 1;
+    }
+    println!("extracted {written} entries → {}", output.display());
+    Ok(())
+}
+
+fn cmd_hexdump(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, limit: usize) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
+    let entry = archive.entries().get(index).ok_or_else(|| anyhow::anyhow!("index {index} out of range"))?;
+    let bytes = archive.read_entry(entry)?;
+    for (row, chunk) in bytes[..bytes.len().min(limit)].chunks(16).enumerate() {
+        let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+        let ascii: String = chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+        println!("{:08x}  {:<47}  |{ascii}|", row * 16, hex.join(" "));
+    }
+    if bytes.len() > limit { println!("… {} bytes total", bytes.len()); }
+    Ok(())
+}
+
+fn cmd_replace(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, file: &PathBuf, output: &PathBuf) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    let replacement = std::fs::read(file)?;
+    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
+    let entry = archive.entries().get(index)
+        .ok_or_else(|| anyhow::anyhow!("entry index {index} out of range"))?;
+
+    if entry.is_zlib(&raw) {
+        rpf9::writer::replace_zlib_inplace(&raw, crypto, index, &replacement, output)
+    } else {
+        rpf9::writer::replace_inplace(&raw, crypto, index, &replacement, output)
+    }
+}
+
+fn cmd_repack(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, patches: &[String], output: &PathBuf) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    let mut replacements = std::collections::HashMap::new();
+    for patch in patches {
+        let (idx_str, file_str) = patch.split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("patch must be index=file, got: {patch}"))?;
+        let idx: usize = idx_str.trim().parse()
+            .context(format!("bad index in patch: {idx_str}"))?;
+        let data = std::fs::read(file_str.trim())
+            .context(format!("reading patch file: {file_str}"))?;
+        replacements.insert(idx, data);
+    }
+    rpf9::writer::repack(&raw, crypto, &replacements, output)
+}
+
+fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, show_structs: bool, limit: usize, dict: &rpf9::hashes::Dict) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
+    let entry = archive.entries().get(index)
+        .ok_or_else(|| anyhow::anyhow!("entry index {index} out of range"))?;
+    let bytes = archive.read_entry(entry)?;
+
+    // Check if it's a nested RPF9 containing PSIN
+    if bytes.starts_with(b"9FPR") {
+        println!("entry #{index} is a nested RPF9 — scanning for PSIN inside...");
+        let nested = rpf9::reader::Archive::open(&bytes, crypto)?;
+        let mut found = 0;
+        for ne in nested.entries() {
+            let nb = nested.read_entry(ne)?;
+            if nb.starts_with(b"PSIN") {
+                found += 1;
+                println!("\n  nested entry #{} ({} bytes):", ne.index, nb.len());
+                let container = rpf9::psin::PsinContainer::parse(&nb)?;
+                rpf9::psin::print_summary(&container);
+                if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
+            }
+        }
+        if found == 0 { println!("  no PSIN entries in nested archive"); }
+        return Ok(());
+    }
+
+    if !bytes.starts_with(b"PSIN") {
+        anyhow::bail!("entry #{index} is not PSIN (starts with {:02x?})", &bytes[..4.min(bytes.len())]);
+    }
+
+    let container = rpf9::psin::PsinContainer::parse(&bytes)?;
+    rpf9::psin::print_summary(&container);
+    if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
+    Ok(())
+}
+
+fn cmd_tree(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, max_depth: usize) -> Result<()> {
+    let raw = std::fs::read(path)?;
+    tree(&raw, &path.display().to_string(), crypto, max_depth, 0)
+}
+
+fn tree(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, max_depth: usize, depth: usize) -> Result<()> {
+    let indent = "  ".repeat(depth);
+    let archive = rpf9::reader::Archive::open(raw, crypto)?;
+    let h = archive.header();
+    println!("{indent}{label} (v{}.{} key#{} {} entries)",
+        h.version_high, h.version_low, archive.key_index(), archive.entries().len());
+
+    for entry in archive.entries() {
+        let ext = archive.sniff(entry);
+        let zlib = if entry.is_zlib(raw) { " zlib" } else { "" };
+        println!("{indent}  #{:<4} {:#010x} {:>10} bytes .{ext}{zlib}",
+            entry.index, entry.offset, entry.size);
+
+        if ext == "rpf" && depth < max_depth {
+            let bytes = archive.read_entry(entry)?;
+            if let Err(e) = tree(&bytes, &format!("#{}", entry.index), crypto, max_depth, depth + 1) {
+                println!("{indent}    (nested open failed: {e})");
+            }
+        }
+    }
+    Ok(())
+}
+
+struct SearchFilter {
+    magic: Option<Vec<u8>>,
+    ext: Option<String>,
+    min_size: Option<u64>,
+    grep: Option<Vec<u8>>,
+}
+
+/// Prints matching entries as `label#index`, descending into nested RPF9s; returns the match count.
+fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &SearchFilter) -> Result<usize> {
+    let archive = rpf9::reader::Archive::open(raw, crypto)?;
+    let mut hits = 0;
+    for entry in archive.entries() {
+        let ext = archive.sniff(entry);
+        let path = format!("{label}#{}", entry.index);
+        let matches = f.min_size.is_none_or(|m| entry.size >= m)
+            && f.ext.as_deref().is_none_or(|e| e.trim_start_matches('.') == ext)
+            && f.magic.as_deref().is_none_or(|m| archive.head(entry, m.len()) == m);
+        // Content is only inflated when needed: for grep, or to recurse.
+        let bytes = if (matches && f.grep.is_some()) || ext == "rpf" { archive.read_entry(entry).ok() } else { None };
+        let grep_ok = match (&f.grep, &bytes) {
+            (None, _) => true,
+            (Some(g), Some(b)) => !g.is_empty() && b.windows(g.len()).any(|w| w == g.as_slice()),
+            (Some(_), None) => false,
+        };
+        if matches && grep_ok {
+            hits += 1;
+            println!("  {path:<24} {:#010x} {:>10} bytes .{ext}", entry.offset, entry.size);
+        }
+        if ext == "rpf" {
+            if let Some(b) = &bytes {
+                match search(b, &path, crypto, f) {
+                    Ok(n) => hits += n,
+                    Err(e) => eprintln!("  {path}: nested open failed: {e}"),
+                }
+            }
+        }
+    }
+    Ok(hits)
+}

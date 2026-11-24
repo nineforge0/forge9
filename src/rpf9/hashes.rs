@@ -1,0 +1,95 @@
+//! joaat hash dictionary: embedded known names plus optional external file.
+
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::path::Path;
+
+const KNOWN: &[(u32, &str)] = &[
+    // Script DOM
+    (0xde396fe2, "root_document"), (0x85b4c631, "attribute"), (0xaeb623d8, "vector3"),
+    (0x01393259, "tree_node"), (0x749dbb9e, "attributes"), (0x2260b8be, "dataNodes"),
+    (0xe6e17f14, "name"), (0xd89231bd, "parentIndex"), (0x01296aed, "childIndex"),
+    (0x881bf649, "siblingIndex"), (0x79661755, "attributeCount"),
+    (0x817ed7a4, "valueHash"), (0x5c2411e5, "strings"), (0xd54b8545, "vectors"),
+    (0x4880f687, "u64_hashes"), (0x649ecf8e, "attr_type"),
+    // Bones
+    (0x00000000, "mover"), (0x6686685c, "skel_root"), (0x8133de19, "skel_pelvis"),
+    (0x9e0fb7af, "skel_spine_root"), (0x41e5d6a1, "skel_spine0"),
+    (0xfb61fbb5, "skel_l_clavicle"), (0xb13045dc, "skel_r_clavicle"),
+    (0x3314f242, "skel_l_thigh"), (0x364e7f26, "skel_r_thigh"),
+    // Tracks
+    (0x98e1750c, "bonerotation"), (0xf791a95f, "bonetranslation"),
+    // World
+    (0xd3593fa6, "CMapData"), (0xce501483, "CEntityDef"), (0x82d6fc83, "CBaseArchetypeDef"),
+    // Packs
+    (0xac9e7e35, "common"), (0x5eb5e655, "data"), (0x938b83b2, "shaders"),
+    (0xa26a72dd, "textures"), (0xe7a8cdf1, "script"), (0xb80c6ae8, "audio"),
+    (0x20ef298e, "movies"), (0x0e5d52e0, "packs"), (0x275b8a30, "levels"),
+    (0x0a802776, "anim"), (0x2eb2ee6e, "navmeshes"),
+];
+
+pub fn joaat(name: &str) -> u32 {
+    let mut h: u32 = 0;
+    for b in name.bytes() {
+        h = h.wrapping_add(b as u32);
+        h = h.wrapping_add(h << 10);
+        h ^= h >> 6;
+    }
+    h = h.wrapping_add(h << 3);
+    h ^= h >> 11;
+    h.wrapping_add(h << 15)
+}
+
+pub struct Dict(HashMap<u32, String>);
+
+impl Dict {
+    /// Embedded names, extended (and overridden) by `path` if given.
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        let mut map: HashMap<u32, String> = KNOWN.iter().map(|&(h, n)| (h, n.to_string())).collect();
+        if let Some(path) = path {
+            let text = std::fs::read_to_string(path).with_context(|| format!("reading dict {}", path.display()))?;
+            map.extend(parse_lines(&text));
+        }
+        Ok(Self(map))
+    }
+
+    pub fn name(&self, hash: u32) -> Option<&str> {
+        self.0.get(&hash).map(String::as_str)
+    }
+
+    /// `0xde396fe2 (root_document)`, or just the hex when unknown.
+    pub fn fmt(&self, hash: u32) -> String {
+        match self.name(hash) {
+            Some(n) => format!("{hash:#010x} ({n})"),
+            None => format!("{hash:#010x}"),
+        }
+    }
+}
+
+/// `hash name` per line, hash in hex (optional 0x); blank and `#` lines ignored.
+fn parse_lines(text: &str) -> impl Iterator<Item = (u32, String)> + '_ {
+    text.lines().filter_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { return None; }
+        let (hash, name) = line.split_once(char::is_whitespace)?;
+        let hash = u32::from_str_radix(hash.trim_start_matches("0x").trim_start_matches("0X"), 16).ok()?;
+        Some((hash, name.trim().to_string()))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joaat_and_dict_lines() {
+        assert_eq!(joaat(""), 0);
+        assert_eq!(joaat("skel_root"), 0x6686685c);
+        assert_eq!(joaat("CMapData"), 0xd3593fa6);
+        let parsed: Vec<_> = parse_lines("# c\n0xdeadbeef foo bar\nzz bad\n12 x\n").collect();
+        assert_eq!(parsed, vec![(0xdeadbeef, "foo bar".to_string()), (0x12, "x".to_string())]);
+        let d = Dict::load(None).unwrap();
+        assert_eq!(d.fmt(0xde396fe2), "0xde396fe2 (root_document)");
+        assert_eq!(d.fmt(0x12345678), "0x12345678");
+    }
+}

@@ -1,0 +1,31 @@
+# Build artifacts
+/target/
+**/*.exe
+**/*.pdb
+
+# Game data and crypto material — never committed
+/bin/
+/data/*.bin
+*.rpf
+*.ttpf
+*.bk2
+*.awc
+
+# Cloned reference repos (local research only)
+/tools/
+/efforts/
+/extracted/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+
+# Added by cargo
+
+/target
