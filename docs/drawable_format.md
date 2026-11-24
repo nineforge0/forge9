@@ -277,14 +277,28 @@ then embeds `diffusetex` as `baseColorTexture` and `bumptex` as
 `normalTexture` (PNG, mip 0; BC5 gets Z rebuilt as `sqrt(1 - x^2 - y^2)`).
 Materials set `metallicFactor` 0; other textures are reported, not mapped.
 
-Locally, 0 of the 12 references resolve: none of the four keys, either
-32-bit half, or the name hashes occurs in `platform.ttpf`,
-`ttdb_graphics.ttpf` or `ttdb_props.ttpf` (1124 textures), anywhere else in
-those files, or in any inflated entry of the story, common or script packs
-besides the dictionary itself. The ttdb_props textures that look like gore
-(a flesh atlas, a skull-like face) do not fit the skulls' UV layouts. So the
-key-to-store mapping is the working assumption, not yet confirmed on a
-sample: the gore textures live in a store that is not present.
+The skulls' 12 references resolve in none of `platform.ttpf`,
+`ttdb_graphics.ttpf` or `ttdb_props.ttpf`: their store is not present.
+The mapping is confirmed on the larger packs (`core_restofworld.rpf`,
+`shared_minigame000.rpf`, `packs.rpf`: 15131 drawables, 145125
+references, 16293 distinct keys) against 19 stores (78169 textures):
+
+- 30901 references (3299 distinct keys) equal a store hash exactly. A
+  chance 64-bit match is about `16293 * 78169 / 2^64`, i.e. none.
+- Resolved formats follow the parameter: `diffusetex` is sRGB in 3481 of
+  3525 (BC7, BC1, BC3 `_SRGB`), `bumptex` is linear in all 2543 (BC1,
+  BC5, BC7 `UNORM`).
+- `cvar_am_python_head_01a` (`core_restofworld.rpf` `1/28`) resolves its
+  diffuse and bump maps in `ttdb_props.ttpf`; rendered, the scales, eye
+  and mouth land on the mesh where they belong.
+- 19166 references use key `5d7a3a87cc19967d` (name hash 0x5c74c225) for
+  unbound slots; it is in no store, so it reads as a null texture.
+
+Stores are opened lazily (`texture::LazyStore`): only the header, chunk
+table and ETPF index are read, then the chunks of each texture that is
+used. A store with no header is skipped with a warning, and a texture whose
+chunks are missing or all zeros (a partially downloaded file) is reported
+as not decoded instead of failing the export.
 
 With store textures forced in place of the keys, the output passes the
 Khronos glTF validator with 0 errors (warning: no TANGENT, since normal

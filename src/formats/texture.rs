@@ -9,6 +9,53 @@ use anyhow::{Context, Result};
 use bcpack::{bc7, bcn, format::Mode};
 pub use bcpack::ttpf::{Store, Texture, CODEC_BC1, CODEC_STORED, CODEC_ZLIB};
 
+/// A store with only its header, chunk table and ETPF index read; `load` reads
+/// one texture's chunks on demand, so multi-GB and partially downloaded stores
+/// cost no more than their index. Unread bytes are zero pages of one allocation.
+pub struct LazyStore {
+    file: std::fs::File,
+    pub store: Store,
+    pub textures: Vec<Texture>,
+}
+
+impl LazyStore {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let mut data = vec![0u8; usize::try_from(file.metadata()?.len())?];
+        let word = |d: &[u8], at: usize| d.get(at..at + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap())) as usize;
+        read_into(&mut file, &mut data, 0, 24)?;
+        anyhow::ensure!(&data[..4] == b"RDS5", "no RDS5 header (missing or not downloaded yet)");
+        let n = word(&data, 4);
+        read_into(&mut file, &mut data, 24, n * 8)?;
+        let etpf = word(&data, 16) << 8;
+        read_into(&mut file, &mut data, etpf, 16)?;
+        let t = word(&data, etpf + 8);
+        read_into(&mut file, &mut data, etpf + 16, t * 24)?;
+        let store = Store::from_bytes(data)?;
+        let textures = store.textures()?;
+        Ok(Self { file, store, textures })
+    }
+
+    /// Reads the chunks from `tex`'s start up to the next texture's; fails when one
+    /// of them is all zeros, as in a partially downloaded store.
+    pub fn load(&mut self, tex: &Texture) -> Result<()> {
+        let end = self.textures.iter().map(|t| t.vstart).filter(|&v| v > tex.vstart).min().unwrap_or(self.store.vsize);
+        for (ci, _, _) in self.store.locate(tex.vstart, end)? {
+            let c = &self.store.chunks[ci];
+            read_into(&mut self.file, &mut self.store.data, c.file_off as usize, c.file_len as usize)?;
+            anyhow::ensure!(self.store.chunk_bytes(ci, true)?.iter().any(|&b| b != 0), "texture {}: chunk {ci} is all zeros (not downloaded yet?)", tex.index);
+        }
+        Ok(())
+    }
+}
+
+fn read_into(file: &mut std::fs::File, data: &mut [u8], at: usize, len: usize) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let buf = data.get_mut(at..at.saturating_add(len)).with_context(|| format!("range {at:#x}+{len:#x} past end of file"))?;
+    file.seek(SeekFrom::Start(at as u64))?;
+    Ok(file.read_exact(buf)?)
+}
+
 pub fn dxgi_name(dxgi: u32) -> &'static str {
     match dxgi {
         28 | 29 => "RGBA8",
@@ -275,6 +322,24 @@ mod tests {
         rebuild_z(&mut px);
         assert_eq!(px, [255, 128, 128, 255, 128, 128, 255, 255]);
         assert_eq!(&material_png(&store, t).unwrap()[1..4], b"PNG");
+    }
+
+    #[test]
+    fn lazy_store_reads_chunks_on_demand_and_rejects_zeros() {
+        let (bytes, _) = synthetic_store();
+        let path = std::env::temp_dir().join(format!("forge9-lazy-{}.ttpf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut s = LazyStore::open(&path).unwrap();
+        assert!(s.store.data[0x100..0x200].iter().all(|&b| b == 0));
+        let t = s.textures[0].clone();
+        s.load(&t).unwrap();
+        assert_eq!(export(&s.store, &t, false, 0).unwrap(), export(&Store::from_bytes(bytes.clone()).unwrap(), &t, false, 0).unwrap());
+        let (mut holed, etpf) = (bytes, s.store.etpf_off as usize);
+        holed[0x100..etpf].fill(0);
+        std::fs::write(&path, &holed).unwrap();
+        let err = LazyStore::open(&path).and_then(|mut s| s.load(&t)).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(format!("{err}").contains("all zeros"));
     }
 
     #[test]
