@@ -154,6 +154,11 @@ impl CryptoContext {
             .context("reading tables.bin")?;
         let keys = std::fs::read(data_dir.join("keys.bin"))
             .context("reading keys.bin")?;
+        Self::from_bytes(tables, keys)
+    }
+
+    /// Same as `load`, from the contents of tables.bin and keys.bin.
+    pub fn from_bytes(tables: Vec<u8>, keys: Vec<u8>) -> Result<Self> {
         if tables.len() != TABLES_SIZE {
             bail!("tables.bin: expected {TABLES_SIZE} bytes, got {}", tables.len());
         }
