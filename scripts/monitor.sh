@@ -61,7 +61,7 @@ for pr in json.load(sys.stdin):
   if [[ -f "$commits_file" ]]; then
     old_commits=$(cat "$commits_file")
     new_shas=$(comm -23 <(echo "$recent_commits" | sort) <(echo "$old_commits" | sort) 2>/dev/null || true)
-    new_count=$(echo "$new_shas" | grep -c '[a-f0-9]' 2>/dev/null || echo "0")
+    new_count=$(echo "$new_shas" | grep -c '[a-f0-9]' || true)
     if [[ "$new_count" -gt 0 ]]; then
       echo "[$repo] $new_count new commit(s) on default branch" >> "$REPORT_FILE"
     fi
