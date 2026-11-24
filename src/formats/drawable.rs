@@ -14,8 +14,10 @@
 //! - vertex buffer: +0x08 u32 elements, +0x0C u16 stride, +0x18 data, +0x40 layout;
 //!   layout: u32 offset per semantic, sizes at +0xD0, formats at +0x104,
 //!   flags at +0x138 (`vertex count << 10 | 1`)
-//! - vertex data starts with 16 u32 attribute descriptors (`format & 127`);
+//! - vertex data starts with 16 u32 attribute descriptors (`format | offset << 7`);
 //!   position format 66 is 8-byte quantized, 99 is float3
+//! - semantic 4 (normal): one u32 per vertex, bits 0..9 / 10..19 an octahedral
+//!   unit vector (unorm10 each); semantics 28 / 29: texcoords, snorm16x2 x `+0x7C f32`
 //! - index data is clustered: per-cluster 7-bit triangle corners remapped
 //!   through a u16/u32 global vertex table
 
@@ -27,13 +29,18 @@ use super::{u16_at, u32_at, u64_at};
 pub const LOD_COUNT: usize = 4;
 const HEADER: usize = 176;
 const MAX_SYSTEM: u64 = 32 << 20;
-const UV_SEMANTIC: usize = 28;
+const NORMAL_SEMANTIC: usize = 4;
+const UV_SEMANTICS: [usize; 2] = [28, 29];
 
 #[derive(Debug)]
 pub struct Mesh {
     pub name: String,
     pub positions: Vec<[f32; 3]>,
+    /// Unit length.
+    pub normals: Option<Vec<[f32; 3]>>,
     pub uvs: Option<Vec<[f32; 2]>>,
+    /// Second texcoord set (glTF TEXCOORD_1 only).
+    pub uvs1: Option<Vec<[f32; 2]>>,
     pub indices: Vec<u32>,
 }
 
@@ -59,6 +66,8 @@ fn header_at(sys: &[u8], at: usize, standalone: bool) -> bool {
     let ptr = |off| u64_at(sys, at + off).is_some_and(system_ptr);
     if sys.len() < at + HEADER || u64_at(sys, at) != Some(0) || ![16, 80, 168].into_iter().all(ptr) { return false; }
     if standalone != ptr(8) || (!standalone && u64_at(sys, at + 8) != Some(0)) { return false; }
+    // LOD 1..3 slots are null or pointers; effect objects with a `{ptr, u16 count, u16 capacity}` list at +0x50 fail here.
+    if ![88, 96, 104].into_iter().all(|off| u64_at(sys, at + off) == Some(0) || ptr(off)) { return false; }
     let (Some(min), Some(max)) = (vec3(sys, at + 48), vec3(sys, at + 64)) else { return false; };
     let radius = f32::from_bits(u32_at(sys, at + 44).unwrap());
     finite(min) && finite(max) && (0..3).all(|i| min[i] <= max[i]) && (0.0..1e6).contains(&radius)
@@ -240,22 +249,40 @@ impl Res<'_> {
             }).collect()
         };
         ensure!(positions.iter().all(|&p| finite(p)), "non-finite vertex positions");
-        let uvs = self.uvs(layout, count, vertex)?;
+        let normals = self.normals(layout, count, vertex)?;
+        let [uvs, uvs1] = [0, 1].map(|i| self.uvs(layout, UV_SEMANTICS[i], count, vertex));
         let indices = self.indices(geometry, count)?;
-        Ok(Mesh { name, positions, uvs, indices })
+        Ok(Mesh { name, positions, normals, uvs: uvs?, uvs1: uvs1?, indices })
     }
 
-    /// TEXCOORD0 as float2 or scaled snorm16x2; `None` when absent or in another encoding.
-    fn uvs(&self, layout: usize, count: usize, vertex: &[u8]) -> Result<Option<Vec<[f32; 2]>>> {
-        let size = self.u8(layout + 0xD0 + UV_SEMANTIC)? as usize;
-        let format = self.u8(layout + 0x104 + UV_SEMANTIC)?;
-        let float = match (size, format) { (8, 16) => true, (4, 38) => false, _ => return Ok(None) };
-        let at = self.u32(layout + UV_SEMANTIC * 4)? as usize;
-        let Some(native) = u32_at(vertex, 12) else { return Ok(None) };
-        if at + count * size > vertex.len() || (native >> 7) & 0x1FF_FFFC != at as u32
-            || ((native >> 3) & 60) as usize != size || native & 15 != if float { 2 } else { 8 } {
-            return Ok(None);
-        }
+    /// Offset of semantic `sem` when the layout declares `(size, format)` and a vertex
+    /// descriptor of `kind` (`& 15`) and `size` points at the same offset.
+    fn attribute(&self, layout: usize, sem: usize, size: usize, format: u8, kind: u32, count: usize, vertex: &[u8]) -> Result<Option<usize>> {
+        if (self.u8(layout + 0xD0 + sem)? as usize, self.u8(layout + 0x104 + sem)?) != (size, format) { return Ok(None); }
+        let at = self.u32(layout + sem * 4)? as usize;
+        let described = (0..16).filter_map(|i| u32_at(vertex, i * 4))
+            .any(|d| (d >> 7) & 0x1FF_FFFC == at as u32 && ((d >> 3) & 60) as usize == size && d & 15 == kind);
+        Ok((described && at + count * size <= vertex.len()).then_some(at))
+    }
+
+    /// Semantic 4 as a 10:10 unorm octahedral unit vector; `None` when absent or in another encoding.
+    /// The word's top 12 bits (likely the tangent frame) are not decoded.
+    fn normals(&self, layout: usize, count: usize, vertex: &[u8]) -> Result<Option<Vec<[f32; 3]>>> {
+        let Some(at) = self.attribute(layout, NORMAL_SEMANTIC, 4, 41, 1, count, vertex)? else { return Ok(None) };
+        Ok(Some((0..count).map(|i| {
+            let w = u32_at(vertex, at + i * 4).unwrap();
+            let [x, y] = [w, w >> 10].map(|c| (c & 1023) as f32 / 511.5 - 1.0);
+            let z = 1.0 - x.abs() - y.abs();
+            let (x, y) = if z < 0.0 { ((1.0 - y.abs()).copysign(x), (1.0 - x.abs()).copysign(y)) } else { (x, y) };
+            let l = (x * x + y * y + z * z).sqrt();
+            [x / l, y / l, z / l]
+        }).collect()))
+    }
+
+    /// Texcoords of semantic `sem` as float2 or scaled snorm16x2; `None` when absent or in another encoding.
+    fn uvs(&self, layout: usize, sem: usize, count: usize, vertex: &[u8]) -> Result<Option<Vec<[f32; 2]>>> {
+        let (snorm, float) = (self.attribute(layout, sem, 4, 38, 8, count, vertex)?, self.attribute(layout, sem, 8, 16, 2, count, vertex)?);
+        let (at, float, size) = match (snorm, float) { (Some(at), _) => (at, false, 4), (_, Some(at)) => (at, true, 8), _ => return Ok(None) };
         let scale = if float { 1.0 } else {
             match u32_at(vertex, 124).map(f32::from_bits) { Some(s) if s.is_finite() && s > 0.0 && s <= 1e6 => s, _ => return Ok(None) }
         };
@@ -323,17 +350,27 @@ impl Res<'_> {
 /// Wavefront OBJ. V is flipped from the top-left (D3D) to the bottom-left convention.
 pub fn to_obj(d: &Drawable) -> String {
     let mut s = format!("# forge9 drawable export: {} LOD{}; positions in source (Z-up) space, no materials\n", d.name.replace(['\r', '\n'], "_"), d.lod);
-    let (mut base, mut base_uv) = (1usize, 1usize);
+    let (mut base, mut base_uv, mut base_n) = (1usize, 1usize, 1usize);
     for m in &d.meshes {
         let _ = writeln!(s, "o {}", m.name);
         for p in &m.positions { let _ = writeln!(s, "v {} {} {}", p[0], p[1], p[2]); }
         for uv in m.uvs.iter().flatten() { let _ = writeln!(s, "vt {} {}", uv[0], 1.0 - uv[1]); }
+        for n in m.normals.iter().flatten() { let _ = writeln!(s, "vn {} {} {}", n[0], n[1], n[2]); }
         for t in m.indices.chunks_exact(3) {
-            let corner = |i: u32| match m.uvs { Some(_) => format!("{}/{}", base + i as usize, base_uv + i as usize), None => (base + i as usize).to_string() };
+            let corner = |i: u32| {
+                let i = i as usize;
+                match (&m.uvs, &m.normals) {
+                    (Some(_), Some(_)) => format!("{}/{}/{}", base + i, base_uv + i, base_n + i),
+                    (Some(_), None) => format!("{}/{}", base + i, base_uv + i),
+                    (None, Some(_)) => format!("{}//{}", base + i, base_n + i),
+                    (None, None) => (base + i).to_string(),
+                }
+            };
             let _ = writeln!(s, "f {} {} {}", corner(t[0]), corner(t[1]), corner(t[2]));
         }
         base += m.positions.len();
         if m.uvs.is_some() { base_uv += m.positions.len(); }
+        if m.normals.is_some() { base_n += m.positions.len(); }
     }
     s
 }
@@ -354,10 +391,16 @@ pub fn to_gltf(d: &Drawable, uri: Option<&str>) -> (String, Vec<u8>) {
         accessors.push(format!(r#"{{"bufferView":{v},"componentType":5126,"count":{n},"type":"VEC3","min":[{},{},{}],"max":[{},{},{}]}}"#,
             min[0], min[1], min[2], max[0], max[1], max[2]));
         let mut attributes = format!(r#""POSITION":{}"#, accessors.len() - 1);
-        if let Some(uvs) = &m.uvs {
+        if let Some(normals) = &m.normals {
+            let v = view(&mut bin, normals.iter().flatten().flat_map(|c| c.to_le_bytes()).collect(), 34962);
+            accessors.push(format!(r#"{{"bufferView":{v},"componentType":5126,"count":{n},"type":"VEC3"}}"#));
+            let _ = write!(attributes, r#","NORMAL":{}"#, accessors.len() - 1);
+        }
+        for (set, uvs) in [&m.uvs, &m.uvs1].into_iter().enumerate() {
+            let Some(uvs) = uvs else { continue };
             let v = view(&mut bin, uvs.iter().flatten().flat_map(|c| c.to_le_bytes()).collect(), 34962);
             accessors.push(format!(r#"{{"bufferView":{v},"componentType":5126,"count":{n},"type":"VEC2"}}"#));
-            let _ = write!(attributes, r#","TEXCOORD_0":{}"#, accessors.len() - 1);
+            let _ = write!(attributes, r#","TEXCOORD_{set}":{}"#, accessors.len() - 1);
         }
         let v = view(&mut bin, m.indices.iter().flat_map(|i| i.to_le_bytes()).collect(), 34963);
         accessors.push(format!(r#"{{"bufferView":{v},"componentType":5125,"count":{},"type":"SCALAR"}}"#, m.indices.len()));
@@ -403,8 +446,17 @@ mod tests {
     fn sp(off: usize) -> [u8; 8] { (VIRTUAL_BASE + off as u64).to_le_bytes() }
     fn gp(off: usize) -> [u8; 8] { (PHYSICAL_BASE + off as u64).to_le_bytes() }
     fn f32s(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() }
+    /// Normals of the quantized fixture, written as unorm10 octahedral words.
+    const NORMALS: [[f32; 3]; 4] = [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [0.6, 0.0, 0.8], [0.0, -0.6, -0.8]];
+    fn oct10(n: [f32; 3]) -> u32 {
+        let l1 = n[0].abs() + n[1].abs() + n[2].abs();
+        let (x, y) = (n[0] / l1, n[1] / l1);
+        let (x, y) = if n[2] < 0.0 { ((1.0 - y.abs()).copysign(x), (1.0 - x.abs()).copysign(y)) } else { (x, y) };
+        let q = |c: f32| ((c + 1.0) * 511.5).round() as u32;
+        q(x) | q(y) << 10 | 0xA << 28
+    }
 
-    /// A quad geometry: `format` 66 (quantized + float2 UVs), 99 (float3), or anything else.
+    /// A quad geometry: `format` 66 (quantized + float2 UVs + normals), 99 (float3), or anything else.
     fn geometry(sys: &mut Vec<u8>, gfx: &mut Vec<u8>, format: u32) -> usize {
         let mut v = vec![0u8; 96];
         let (at, size, lfmt) = if format == 66 { (128, 8u8, 16u8) } else { (96, 12, 6) };
@@ -419,6 +471,8 @@ mod tests {
             }
             put(&mut v, 12, &(160u32 << 7 | 8 << 3 | 2).to_le_bytes());
             put(&mut v, 160, &f32s(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]));
+            put(&mut v, 8, &(192u32 << 7 | 4 << 3 | 1).to_le_bytes());
+            for (i, n) in NORMALS.into_iter().enumerate() { put(&mut v, 192 + i * 4, &oct10(n).to_le_bytes()); }
         } else {
             put(&mut v, at, &f32s(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0]));
         }
@@ -449,9 +503,11 @@ mod tests {
         put(sys, layout + 0xD0, &[size]);
         put(sys, layout + 0x104, &[lfmt]);
         if format == 66 {
-            put(sys, layout + UV_SEMANTIC * 4, &160u32.to_le_bytes());
-            put(sys, layout + 0xD0 + UV_SEMANTIC, &[8]);
-            put(sys, layout + 0x104 + UV_SEMANTIC, &[16]);
+            for (sem, at, size, format) in [(UV_SEMANTICS[0], 160u32, 8, 16), (NORMAL_SEMANTIC, 192, 4, 41)] {
+                put(sys, layout + sem * 4, &at.to_le_bytes());
+                put(sys, layout + 0xD0 + sem, &[size]);
+                put(sys, layout + 0x104 + sem, &[format]);
+            }
         }
         put(sys, layout + 0x138, &(4u32 << 10 | 1).to_le_bytes());
         put(sys, desc, &sp(ib));
@@ -522,19 +578,24 @@ mod tests {
         assert!(e.contains("2 system and no graphics pages"), "{e}");
     }
 
-    /// Real-file check: the only drawable resource of the story content archive, when present locally.
-    #[test]
-    fn decodes_real_dictionary() {
+    /// Blocks of entry `inner` of nested archive `outer` of the story content archive, when present locally.
+    fn real_entry(outer: usize, inner: usize) -> Option<Vec<Vec<u8>>> {
+        use crate::rpf9::reader::Archive;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let (Ok(raw), Ok(crypto)) = (std::fs::read(root.join("bin/story000_restofworld.rpf")), crate::rpf9::crypto::CryptoContext::load(&root.join("data"))) else {
             eprintln!("skipping: bin/story000_restofworld.rpf or data/*.bin not present");
-            return;
+            return None;
         };
-        use crate::rpf9::reader::Archive;
-        let outer = Archive::open(&raw, &crypto).unwrap();
-        let nested = outer.read_entry(&outer.entries()[19]).unwrap();
-        let inner = Archive::open(&nested, &crypto).unwrap();
-        let blocks = inner.read_entry_blocks(&inner.entries()[0]).unwrap();
+        let archive = Archive::open(&raw, &crypto).unwrap();
+        let nested = archive.read_entry(&archive.entries()[outer]).unwrap();
+        let nested = Archive::open(&nested, &crypto).unwrap();
+        Some(nested.read_entry_blocks(&nested.entries()[inner]).unwrap())
+    }
+
+    /// Real-file check: the only drawable resource of the story content archive.
+    #[test]
+    fn decodes_real_dictionary() {
+        let Some(blocks) = real_entry(19, 0) else { return };
         let members = dictionary(&blocks[0]).unwrap();
         let d = parse_blocks(&blocks, 0).unwrap();
         assert_eq!((members.len(), d.meshes.len(), d.skipped.len()), (3, 3, 0));
@@ -543,13 +604,73 @@ mod tests {
         assert_eq!((verts, tris), (1808, 2620));
         for (m, &at) in d.meshes.iter().zip(&members) {
             let n = m.positions.len() as u32;
-            assert!(m.indices.iter().all(|&i| i < n) && m.uvs.is_some());
+            assert!(m.indices.iter().all(|&i| i < n));
             // Every vertex lies inside its drawable's header bounds, up to quantization error.
             let (min, max) = (vec3(&blocks[0], at + 48).unwrap(), vec3(&blocks[0], at + 64).unwrap());
             for p in &m.positions {
                 assert!((0..3).all(|k| p[k] >= min[k] - 1e-3 && p[k] <= max[k] + 1e-3), "{} {p:?}", m.name);
             }
         }
+    }
+
+    /// Real-file check of the normal and texcoord decode on the same dictionary.
+    #[test]
+    fn decodes_real_normals_and_texcoords() {
+        let Some(blocks) = real_entry(19, 0) else { return };
+        let d = parse_blocks(&blocks, 0).unwrap();
+        for (mi, m) in d.meshes.iter().enumerate() {
+            // Normals: unit length, and on the same side as the area-weighted face normals for >= 97% of vertices.
+            let normals = m.normals.as_ref().unwrap();
+            assert!(normals.iter().all(|v| ((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() - 1.0).abs() < 1e-5));
+            let mut face = vec![[0f32; 3]; normals.len()];
+            for t in m.indices.chunks_exact(3) {
+                let [a, b, c] = [0, 1, 2].map(|k| m.positions[t[k] as usize]);
+                let (u, w) = ([0, 1, 2].map(|k| b[k] - a[k]), [0, 1, 2].map(|k| c[k] - a[k]));
+                let cross = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+                for &i in t { for k in 0..3 { face[i as usize][k] += cross[k]; } }
+            }
+            let agree = normals.iter().zip(&face).filter(|(v, f)| (0..3).map(|k| v[k] * f[k]).sum::<f32>() > 0.0).count();
+            assert!(agree * 100 >= normals.len() * 97, "{}: {agree}/{} normals agree with faces", m.name, normals.len());
+            // Texcoords (snorm16 x 4.0): set 1 everywhere and set 0 of the jaw and fragment lie in 0..1; set 0
+            // of skull_01 spans -1.04..1.94 (neighbouring tiles, no wrap seam inside a triangle).
+            let in_unit = |uv: &Vec<[f32; 2]>| uv.iter().flatten().all(|c| (0.0..=1.0).contains(c));
+            let uv0 = m.uvs.as_ref().unwrap();
+            assert!(in_unit(m.uvs1.as_ref().unwrap()) && (mi == 0 || in_unit(uv0)), "{}", m.name);
+            assert!(uv0.iter().flatten().all(|c| (-1.05..=1.95).contains(c)));
+        }
+    }
+
+    /// Real-file check: the particle effect list next to the dictionary has objects with a
+    /// `{ptr, count, capacity}` list at +0x50 that used to pass the header check.
+    #[test]
+    fn rejects_real_effect_objects() {
+        let Some(blocks) = real_entry(20, 0) else { return };
+        let sys = blocks[..2].concat();
+        assert!((0..sys.len()).step_by(16).all(|o| !header_at(&sys, o, false) && !header_at(&sys, o, true)));
+        assert!(parse_blocks(&blocks, 0).is_err());
+    }
+
+    #[test]
+    fn decodes_octahedral_normals() {
+        let d = parse_blocks(&synthetic(false), 0).unwrap();
+        for (n, want) in d.meshes[0].normals.as_ref().unwrap().iter().zip(NORMALS) {
+            assert!(((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() - 1.0).abs() < 1e-5, "{n:?} not unit");
+            assert!((0..3).all(|k| (n[k] - want[k]).abs() < 4e-3), "{n:?} != {want:?}");
+        }
+        assert!(d.meshes[1].normals.is_none());
+        let json = to_gltf(&d, None).0;
+        assert!(json.contains(r#""POSITION":0,"NORMAL":1,"TEXCOORD_0":2"#), "{json}");
+        let obj = to_obj(&d);
+        assert_eq!(obj.matches("\nvn ").count(), 4);
+        assert!(obj.contains("f 4/4/4 3/3/3 2/2/2") && obj.contains("f 8 6 5"), "{obj}");
+    }
+
+    #[test]
+    fn rejects_list_in_lod_slot() {
+        let mut blocks = synthetic(false);
+        assert!(looks_like(&blocks[0]));
+        put(&mut blocks[0], 88, &0x0002_0002u64.to_le_bytes());
+        assert!(!looks_like(&blocks[0]));
     }
 
     #[test]
@@ -560,6 +681,7 @@ mod tests {
         let q = &d.meshes[0];
         assert_eq!(q.positions, [[10.0, 20.0, 30.0], [11.0, 20.0, 30.0], [11.0, 21.0, 30.0], [10.0, 21.0, 32.0]]);
         assert_eq!(q.uvs.as_deref(), Some(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]][..]));
+        assert!(q.uvs1.is_none());
         // refs table is reversed, so local (0,1,2),(0,2,3) remaps to (3,2,1),(3,1,0)
         assert_eq!(q.indices, [3, 2, 1, 3, 1, 0]);
         let f = &d.meshes[1];
@@ -570,11 +692,11 @@ mod tests {
         assert_eq!((&glb[0..4], u32_at(&glb, 8).unwrap() as usize), (&b"glTF"[..], glb.len()));
         let json_len = u32_at(&glb, 12).unwrap() as usize;
         let json = std::str::from_utf8(&glb[20..20 + json_len]).unwrap();
-        assert!(json.contains(r#""TEXCOORD_0":1"#) && json.contains(r#""min":[10,20,30],"max":[11,21,32]"#), "{json}");
+        assert!(json.contains(r#""TEXCOORD_0":2"#) && json.contains(r#""min":[10,20,30],"max":[11,21,32]"#), "{json}");
         assert_eq!(u32_at(&glb, 20 + json_len).unwrap() as usize, glb.len() - 28 - json_len);
         let obj = to_obj(&d);
-        assert_eq!((obj.matches("\nv ").count(), obj.matches("\nvt ").count(), obj.matches("\nf ").count()), (8, 4, 4));
-        assert!(obj.contains("f 4/4 3/3 2/2") && obj.contains("f 8 6 5"), "{obj}");
+        assert_eq!((obj.matches("\nv ").count(), obj.matches("\nvt ").count(), obj.matches("\nvn ").count(), obj.matches("\nf ").count()), (8, 4, 4, 4));
+        assert!(obj.contains("f 4/4/4 3/3/3 2/2/2"), "{obj}");
 
         // `FORGE9_FIXTURE_OUT=path` writes the entry as a zlib block chain, for `repack` + `model` end-to-end runs.
         if let Ok(path) = std::env::var("FORGE9_FIXTURE_OUT") {

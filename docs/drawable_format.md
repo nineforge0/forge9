@@ -103,16 +103,57 @@ layout pointer (0x50000a30). Byte length is count x stride (8696).
 
 Layout (320 bytes, 0xa30): +0x00 one u32 byte offset per semantic (0x80 when
 absent), +0xD0 one u8 size per semantic, +0x104 one u8 format per semantic,
-+0x138 u32 `vertex count << 10 | 1` (0x59461: 357 vertices). Present in the
-jaw: semantic 0 (position, size 8, format 16), 4 (size 4, format 41), 24
-(size 4, format 28), 28 and 29 (texcoords, size 4, format 38 = snorm16x2).
++0x138 u32 `vertex count << 10 | 1` (0x59461: 357 vertices). The format
+bytes match DXGI numbering (16 R32G32_FLOAT, 41 R32_FLOAT, 28 R8G8B8A8_UNORM,
+38 R16G16_SNORM); the declared format is the storage width, not always the
+meaning. All three members use the same five semantics:
 
-Vertex data starts with u32 attribute descriptors `format | offset << 7`
-(0x4042: format 66 at offset 0x80). Format-66 positions are 8 bytes:
-24-bit X, 24-bit Y, 16-bit Z lanes, decoded as `bias + scale * lane` with
-`+96 f32x3 bias`, `+108 u32 axis order`, `+112 f32x3 scale`. In the jaw the
-bias equals the header AABB min and `scale * (2^24 - 1, 2^24 - 1, 2^16 - 1)`
-spans the AABB extent exactly. Texcoord snorm16 values scale by `+124 f32`.
+| Semantic | Size | Format | Descriptor | Meaning | Decoded |
+|---------:|-----:|-------:|-----------:|---------|---------|
+| 0 | 8 | 16 | 0x42 (66) | quantized position | yes |
+| 4 | 4 | 41 | 0x21 (33) | normal, octahedral 10:10 + 12 more bits | normal yes, upper bits no |
+| 24 | 4 | 28 | 0x26 (38) | RGBA8, values like 0xff1bffff (vertex color) | no |
+| 28 | 4 | 38 | 0x28 (40) | texcoord set 0, snorm16x2 | yes (TEXCOORD_0) |
+| 29 | 4 | 38 | 0x28 (40) | texcoord set 1, snorm16x2 | yes (TEXCOORD_1) |
+
+Vertex data starts with 16 u32 attribute descriptors `kind | size << 3 |
+offset << 7` (low 4 bits a kind, `(d >> 3) & 60` the byte size; 0x4042:
+format 66 at offset 0x80). Descriptor slots are not in semantic order
+(skull_01: position, 24, 4, 28, 29), so the decoder matches a descriptor to
+a semantic by offset. Format-66 positions are 8 bytes: 24-bit X, 24-bit Y,
+16-bit Z lanes, decoded as `bias + scale * lane` with `+96 f32x3 bias`,
+`+108 u32 axis order`, `+112 f32x3 scale`. In the jaw the bias equals the
+header AABB min and `scale * (2^24 - 1, 2^24 - 1, 2^16 - 1)` spans the AABB
+extent exactly. `+0x5C` is u32 0x200 in all three (not decoded).
+
+### Normals (semantic 4)
+
+One u32 per vertex. Bits 0..9 and 10..19 are unorm10 `x, y` of an
+octahedral unit vector (`c / 511.5 - 1`; `z = 1 - |x| - |y|`, and when
+`z < 0` the lower hemisphere fold `x' = (1 - |y|) sign x, y' = (1 - |x|)
+sign y`), then normalized. Bits 20..31 are not decoded; bits 30..31 are
+`10` or `11` for 98% of vertices, so they are probably a tangent angle plus
+a bitangent sign.
+
+How it was found: per-vertex area-weighted face normals were computed from
+the decoded positions and indices and compared with candidate decodes of
+every 4-byte semantic. Plain 10:10:10 vectors had the right direction but
+lengths of 0.06..1.5; the first two fields matched `n.xy / (|x|+|y|+|z|)`
+of the face normal (for example face `(-0.060, 0.267, 0.962)` vs stored
+`(-0.046, 0.208)`), which is the octahedral projection. Semantic 24 decoded
+in every candidate scheme gave a mean dot of at most 0.2 (it is color).
+
+### Texcoords (semantics 28, 29)
+
+snorm16x2 (`/ 32767`, clamped at -1) times the f32 at vertex data +0x7C
+(4.0 in all three). Evidence for the 4.0 factor: before scaling, set 1 of
+all three meshes and set 0 of jaw_01 and skull_02 top out at 0.2401..0.2485,
+just under 0.25, so `x 4` maps them into 0..1. Set 0 of skull_01 spans
+u -1.04..1.94: its charts sit in the neighbouring tiles (249 vertices with
+u in -1..0, 740 in 1..2), but no triangle spans more than 0.25 in UV, and
+its UV-per-length scale (median 0.25) matches the other meshes (0.19..0.22).
+That is the shape of islands offset by whole tiles under a repeating
+sampler, not a decode error; it cannot be confirmed without the material.
 
 ## Index data
 
@@ -126,6 +167,8 @@ index from bit 21), and the u16 cluster-to-vertex table. This is the
 clustered decode documented at the top of `src/formats/drawable.rs`.
 
 ## Validation of the export
+
+Geometry:
 
 `forge9 model bin/story000_restofworld.rpf 19/0 -o out.glb` (or `--obj`):
 
@@ -141,9 +184,60 @@ clustered decode documented at the top of `src/formats/drawable.rs`.
 - 83% to 95% of directed edges have an opposite twin (consistent winding on a
   connected surface); a wrong index decode does not produce this.
 - Rendered, the three meshes are a skull, a jaw and a skull fragment.
-- `decodes_real_dictionary` in `src/formats/drawable.rs` re-checks counts and
-  bounds whenever the archive is present locally.
 
-Not validated: texcoords (decoded; the jaw and skull_02 fall in 0..1, skull_01
-spans -1.04..1.94), normals, the +0xB0 lists, the geometry OBB, LODs 1..3
-(this file has only LOD 0), standalone drawables and fragments on real data.
+Normals and texcoords (dot = decoded normal vs area-weighted face normal):
+
+| Drawable | Unit length (1e-3) | dot > 0 | dot > 0.9 | Mean dot | TEXCOORD_0 | TEXCOORD_1 |
+|----------|-------------------:|--------:|----------:|---------:|------------|------------|
+| skull_01 | 100% | 99.1% | 80.2% | 0.927 | u -1.039..1.942, v 0.028..0.981 | u 0.011..0.985, v 0.315..0.931 |
+| jaw_01 | 100% | 97.2% | 68.6% | 0.857 | u 0.058..0.909, v 0.343..0.779 | u 0.011..0.960, v 0.669..0.994 |
+| skull_02 | 100% | 99.4% | 94.1% | 0.970 | u 0.110..0.592, v 0.358..0.991 | u 0.027..0.900, v 0.008..0.326 |
+
+The vertices with dot below 0 sit where a face normal is a poor reference
+(teeth, thin creases). A Lambert render with the decoded normals is smoothly
+shaded. Positions and indices are byte-identical to the export before
+normals were added.
+
+Tests in `src/formats/drawable.rs` (the real-file ones skip when the archive
+is absent): `decodes_real_dictionary` (counts, bounds),
+`decodes_real_normals_and_texcoords` (unit length, at least 97% agreement
+with face normals, UV ranges), `rejects_real_effect_objects`, plus the
+synthetic `decodes_octahedral_normals` and `rejects_list_in_lod_slot`.
+
+## Header false positives in the particle effect list (`20/0`)
+
+The drawable header check used to accept 16 objects in `20/0`'s system
+pages: their +0x50 is a pointer followed by `u16 count 2, u16 capacity 2`
+(or 1, 1) in the LOD 1 slot, with an empty name. Requiring the LOD 1..3
+slots (+0x58..+0x68) to be null or system pointers rejects all 16 and keeps
+all three real members. The effect list names models (`brain_s1`,
+`bone_02`, `bone_03` and others) that are not in this archive; only
+skull_01, skull_02 and jaw_01 are.
+
+## Which local packs hold meshes
+
+`forge9 search <pack> --drawable` lists every entry `model` can export.
+Census of every entry, recursing into nested archives (the texture stores
+were listed with `forge9 texture`):
+
+| Pack | Entries | Meshes |
+|------|---------|--------|
+| `story000_restofworld.rpf` | 486 leaf entries (top level and nested): 101 `0DRP` metadata, 344 paged without graphics (animation, metadata), 1 drawable dictionary, 1 particle effect list, 7 Bink videos, 14 AWC, 15 XML/PSIN, 3 small blobs | 1 dictionary (`19/0`), 3 drawables, LOD 0 only |
+| `common.rpf` | 418: XML, PSIN, ADAT, high-entropy blobs | none |
+| `script.rpf` | 1011 PSIN, one 2.7 MB blob | none |
+| `shaders.rpf` | 2 SGD5 shader stores, 1 PS09 pipeline cache | none |
+| `appdata0.rpf` | 2 small encrypted blobs | none |
+| `platform.ttpf`, `ttdb_graphics.ttpf`, `ttdb_props.ttpf` | RDS5 texture stores (1, 912, 211 textures) | none (textures only) |
+
+So the only local mesh content is three small effect models. Props,
+vehicles, peds and world geometry are in packs that are not present: per-
+level/streamed content archives with more nested archives like the story
+pack (where world drawables, drawable dictionaries and fragments would be),
+and dedicated vehicle and character packs. Those are where standalone
+drawables, fragments, skinned meshes, float3 positions and LODs 1..3 need
+to be validated.
+
+Not validated (no local sample): standalone drawables, LODs 1..3, the
+float3 (99) position path, float2 texcoords, fragments, skinned meshes.
+Not decoded: normal bits 20..31 (likely tangent frame), vertex colors
+(semantic 24), the +0xB0 lists, the geometry OBB, materials.
