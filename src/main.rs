@@ -1,5 +1,4 @@
-mod rpf9;
-
+use forge9::{formats, modding, rpf9};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -104,6 +103,61 @@ enum Command {
     },
     /// Compute the joaat hash of a name
     Hash { name: String },
+    /// List audio streams in an AWC entry
+    Awc {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+    },
+    /// List shader records in an SGD5 entry
+    Shaders {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+        /// Only count records per stage and tag
+        #[arg(long)]
+        summary: bool,
+    },
+    /// Show Bink 2 video header info
+    Bink {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+    },
+    /// Show paged resource (0DRP) info
+    Resource {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+    },
+    /// Create, verify and apply mod packs
+    #[command(subcommand)]
+    Mod(ModCommand),
+}
+
+#[derive(Subcommand)]
+enum ModCommand {
+    /// Write a template mod.toml
+    Init {
+        #[arg(default_value = "mod.toml")]
+        path: PathBuf,
+    },
+    /// Check that replacement files exist and fit the target archive
+    Verify {
+        manifest: PathBuf,
+        /// Archive to check against (default: the manifest's target_archive)
+        #[arg(long)]
+        archive: Option<PathBuf>,
+    },
+    /// Apply the manifest's replacements, writing a repacked archive
+    Apply {
+        manifest: PathBuf,
+        #[arg(short, long, default_value = "modded.rpf")]
+        output: PathBuf,
+        /// Archive to patch (default: the manifest's target_archive)
+        #[arg(long)]
+        archive: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -113,6 +167,20 @@ fn main() -> Result<()> {
         let h = rpf9::hashes::joaat(name);
         println!("{h:#010x}  {name}");
         if let Some(known) = dict.name(h).filter(|k| k != name) { println!("  (dictionary: {known})"); }
+        return Ok(());
+    }
+    if let Command::Mod(ModCommand::Init { path }) = &cli.command {
+        if path.exists() { anyhow::bail!("{} already exists", path.display()); }
+        std::fs::write(path, modding::manifest::TEMPLATE)?;
+        println!("wrote {}", path.display());
+        return Ok(());
+    }
+    if let Command::Mod(ModCommand::Verify { manifest, archive }) = &cli.command {
+        let m = modding::manifest::Manifest::load(manifest)?;
+        let crypto = rpf9::crypto::CryptoContext::load(&cli.data_dir).ok();
+        let problems = modding::apply::verify(&m, archive.as_deref(), crypto.as_ref())?;
+        if problems > 0 { anyhow::bail!("{problems} problem(s) found"); }
+        println!("ok: {} replacement(s)", m.replace.len());
         return Ok(());
     }
     let crypto = rpf9::crypto::CryptoContext::load(&cli.data_dir)
@@ -134,7 +202,15 @@ fn main() -> Result<()> {
             println!("{hits} matches");
             Ok(())
         }
-        Command::Hash { .. } => unreachable!(),
+        Command::Awc { archive, index } => cmd_awc(&load_entry(&archive, &crypto, &index)?),
+        Command::Shaders { archive, index, summary } => cmd_shaders(&load_entry(&archive, &crypto, &index)?, summary),
+        Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
+        Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
+        Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
+            let m = modding::manifest::Manifest::load(&manifest)?;
+            modding::apply::apply(&m, archive.as_deref(), &crypto, &output)
+        }
+        Command::Hash { .. } | Command::Mod(_) => unreachable!(),
     }
 }
 
@@ -340,4 +416,66 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
         }
     }
     Ok(hits)
+}
+
+/// Reads an entry by `index`, where `a/b/c` descends through nested RPF9s.
+fn load_entry(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<u8>> {
+    let mut bytes = std::fs::read(path)?;
+    for part in index.split(['/', '#']).filter(|p| !p.is_empty()) {
+        let i: usize = part.parse().with_context(|| format!("bad entry index {part:?}"))?;
+        let archive = rpf9::reader::Archive::open(&bytes, crypto)?;
+        let entry = archive.entries().get(i).ok_or_else(|| anyhow::anyhow!("entry index {i} out of range"))?;
+        bytes = archive.read_entry(entry)?;
+    }
+    Ok(bytes)
+}
+
+fn cmd_awc(bytes: &[u8]) -> Result<()> {
+    let awc = formats::awc::parse(bytes)?;
+    println!("AWC v{} flags {:#06x} header {:#x} — {} streams", awc.version, awc.flags, awc.header_size, awc.streams.len());
+    for s in &awc.streams {
+        let fmt = match s.format {
+            Some(f) => {
+                let rate = if f.codec == 0x0B { "48000 Hz (Opus)".to_string() } else { format!("{} Hz", f.sample_rate) };
+                format!("{:<7} {}ch {rate} {} samples", formats::awc::codec_name(f.codec), f.channels, f.samples)
+            }
+            None => "no format".to_string(),
+        };
+        let data = s.chunk(formats::awc::TAG_DATA).map_or(0, |c| c.size);
+        let tags: Vec<&str> = s.chunks.iter().map(|c| formats::awc::tag_name(c.tag)).collect();
+        println!("  {:#09x}  {fmt}  data {data} bytes  [{}]", s.id, tags.join(","));
+    }
+    Ok(())
+}
+
+fn cmd_shaders(bytes: &[u8], summary: bool) -> Result<()> {
+    let shaders = formats::sgd5::parse(bytes)?;
+    let mut counts = std::collections::BTreeMap::new();
+    for s in &shaders {
+        *counts.entry((s.stage(), s.tag)).or_insert(0usize) += 1;
+        if !summary {
+            println!("  {:#010x}  {:<3} {:#04x} {:<13} {:>8} → {:>8}  {}", s.offset, s.stage(), s.tag, formats::sgd5::tag_name(s.tag), s.csize, s.dsize, s.name);
+        }
+    }
+    println!("{} shader records", shaders.len());
+    for ((stage, tag), n) in counts {
+        println!("  {stage:<3} {tag:#04x} {:<13} {n}", formats::sgd5::tag_name(tag));
+    }
+    Ok(())
+}
+
+fn cmd_bink(bytes: &[u8]) -> Result<()> {
+    let b = formats::bink::parse(bytes)?;
+    println!("Bink 2 rev '{}'  {}x{}  {} frames @ {:.3} fps ({}/{})  {:.2}s  file {} bytes  largest frame {} bytes",
+        b.revision, b.width, b.height, b.frames, b.fps(), b.fps_num, b.fps_den, b.duration_secs(), b.file_size, b.largest_frame);
+    Ok(())
+}
+
+fn cmd_resource(bytes: &[u8]) -> Result<()> {
+    let r = formats::resource::parse(bytes)?;
+    let magic = r.magic_at.map_or("none".to_string(), |m| format!("0DRP at {m:#x}"));
+    let version = r.version.map_or(String::new(), |v| format!(" version {v:#x}"));
+    println!("{:?} resource, {} bytes, magic {magic}{version}", r.kind, bytes.len());
+    println!("  pointer-like words: {} virtual, {} physical", r.virtual_ptrs, r.physical_ptrs);
+    Ok(())
 }

@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use crate::rpf9::crypto::{CryptoContext, TAG_IV};
-use crate::rpf9::header::{Header, HEADER_SIZE};
+use crate::rpf9::header::HEADER_SIZE;
 use crate::rpf9::reader::Archive;
 
 /// Replace a single entry's payload in-place (same size only).

@@ -165,7 +165,7 @@ impl CryptoContext {
         Ok(Self { tables, keys, inverse })
     }
 
-    pub fn schedule(&self, index: usize) -> Result<KeySchedule> {
+    pub fn schedule(&self, index: usize) -> Result<KeySchedule<'_>> {
         if index >= KEY_COUNT {
             bail!("key index {index} out of range (0..{KEY_COUNT})");
         }
@@ -360,13 +360,15 @@ impl<'a> KeySchedule<'a> {
 mod tests {
     use super::*;
 
-    fn context() -> CryptoContext {
-        CryptoContext::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("data")).unwrap()
+    fn context() -> Option<CryptoContext> {
+        let ctx = CryptoContext::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("data")).ok();
+        if ctx.is_none() { eprintln!("skipping: data/tables.bin or data/keys.bin not present"); }
+        ctx
     }
 
     #[test]
     fn block_roundtrip_all_keys() {
-        let crypto = context();
+        let Some(crypto) = context() else { return; };
         let mut seed = 0x1234_5678u32;
         for index in 0..KEY_COUNT {
             let schedule = crypto.schedule(index).unwrap();
@@ -390,7 +392,7 @@ mod tests {
             eprintln!("skipping: {} not present", path.display());
             return;
         };
-        let crypto = context();
+        let Some(crypto) = context() else { return; };
         let archive = crate::rpf9::reader::Archive::open(&raw, &crypto).unwrap();
         assert_eq!(archive.key_index(), 4);
         let schedule = crypto.schedule(archive.key_index()).unwrap();

@@ -10,8 +10,13 @@ RPF9 is a container format used by a well-known retail game engine. This tool ha
 - **Inspect** headers, entry counts, key IDs, version info and flags
 - **List** all entries with offset, size, format detection (zlib, XML, PSIN, nested RPF9, etc.)
 - **Extract** entries to disk with automatic zlib chain inflation
+- **Tree / search** nested RPF9 archives by magic, extension, size or content
+- **Replace / repack** entries in place or at any size, re-encrypting the TOC
+- **Decode payloads**: AWC audio streams, SGD5 shader databases, Bink 2 video headers, PSIN game data, paged resources
+- **Mod packs**: a TOML manifest of entry replacements, verified and applied in one command
 - **Hexdump** individual entries for analysis
 - **JSON output** for integration with other tools
+- **Library crate**: every decoder is usable from Rust as `forge9::formats::*`
 
 ## Usage
 
@@ -23,6 +28,10 @@ forge9 info archive.rpf
 forge9 list archive.rpf
 forge9 list archive.rpf --json
 
+# Nested archives and searching
+forge9 tree archive.rpf --depth 2
+forge9 search archive.rpf --magic ADAT
+
 # Extract all entries
 forge9 extract archive.rpf -o output_dir
 
@@ -31,7 +40,102 @@ forge9 extract archive.rpf --select 0,1,5
 
 # Hex dump entry #0
 forge9 hexdump archive.rpf 0 --limit 256
+
+# Rebuild with replaced entries (any size)
+forge9 repack archive.rpf --patch 6=new.xml -o repacked.rpf
 ```
+
+### Format decoders
+
+Every decoder takes an archive and an entry index. Use `a/b` to reach an entry inside a nested RPF9
+(e.g. `5/3` is entry 3 of the archive stored as entry 5).
+
+```bash
+# Audio streams: id, codec, channels, sample rate, sample count, chunks
+forge9 awc audio.rpf 12/0
+
+# Shader records: name, stage, record tag, compressed/decompressed size
+forge9 shaders shaders.rpf 2
+forge9 shaders shaders.rpf 0 --summary     # counts per stage and tag
+
+# Bink 2 video: dimensions, frame count, frame rate, duration
+forge9 bink archive.rpf 3
+
+# PSIN game data and paged resources
+forge9 psin script.rpf 0 --structs
+forge9 resource archive.rpf 7
+
+# joaat hash of a name
+forge9 hash player_one
+```
+
+### Mod packs
+
+A mod is a `mod.toml` listing entry replacements. Paths are relative to the manifest.
+
+```toml
+[mod]
+name = "example-mod"
+version = "0.1.0"
+description = "Example mod"
+target_archive = "common.rpf"
+
+[[replace]]
+entry = 6
+file = "mods/my_config.xml"
+
+[[replace]]
+entry = 12
+file = "mods/modified_data.bin"
+```
+
+```bash
+forge9 mod init                          # write a template mod.toml
+forge9 mod verify mod.toml               # files exist, indices in range, sizes sane
+forge9 mod apply mod.toml -o modded.rpf  # repack the target with every replacement
+```
+
+`verify` and `apply` take `--archive path.rpf` to override `target_archive`. Replacement bytes are stored as
+given (uncompressed); readers detect zlib per entry, so plain payloads read back as-is.
+
+## Supported formats
+
+| Format | Magic | Command | Status |
+|---|---|---|---|
+| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
+| zlib chains | `78 xx` | (automatic) | Inflated on read |
+| PSIN / PSO game data | `PSIN` | `psin` | Block table, struct schemas |
+| AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
+| SGD5 shader database | `SGD5` | `shaders` | Record names, stages, tags, sizes; DXBC payload offsets |
+| Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
+| Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
+| XML, DDS, PNG, GFX, RBF, RDS5 | various | `list` | Detected only |
+
+## Architecture
+
+```
+src/
+  lib.rs            library root (`forge9` crate)
+  main.rs           CLI: one subcommand per cmd_* function
+  rpf9/             the archive container
+    header.rs       fixed header
+    crypto.rs       T-table cipher, key schedules, CBC
+    entry.rs        TOC records (indexed and stored layouts)
+    reader.rs       Archive::open with key discovery, entry reads, format sniffing
+    writer.rs       in-place replace and full repack
+    psin.rs         PSIN / PSO data
+    hashes.rs       joaat and name dictionaries
+  formats/          payload decoders (one file per format)
+    awc.rs          AWC audio containers
+    sgd5.rs         SGD5 shader databases
+    bink.rs         Bink 2 video headers
+    resource.rs     0DRP paged resources
+  modding/          mod packs
+    manifest.rs     mod.toml format
+    apply.rs        verify and apply against an archive
+```
+
+Adding a format is one file in `src/formats/` plus a subcommand; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Crypto data
 
@@ -54,12 +158,21 @@ cargo build --release
 
 ## Roadmap
 
-- [ ] Archive repacking (encrypt + rebuild TOC)
-- [ ] Name recovery from hash dictionaries
-- [ ] Nested RPF9 recursive inspection
-- [ ] PSIN/PSO data structure browser
-- [ ] Payload format decoders (textures, models, audio)
+- [x] Archive repacking (encrypt + rebuild TOC)
+- [x] Nested RPF9 recursive inspection
+- [x] Audio, shader and video container parsing
+- [x] Mod pack manifests
+- [ ] Name recovery from larger hash dictionaries
+- [ ] PSIN binary-XML editor (read-modify-write values)
+- [ ] Texture decoders (BCPack / BCn)
+- [ ] Model export (glTF) from paged resources
+- [ ] Pipeline cache (PS09) parsing
 - [ ] Streaming world analysis tools
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[good first issues](https://github.com/nineforge0/forge9/labels/good%20first%20issue).
 
 ## License
 
