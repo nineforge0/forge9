@@ -4,6 +4,7 @@ pub mod awc;
 pub mod bink;
 pub mod resource;
 pub mod sgd5;
+pub mod texture;
 
 pub(crate) fn u16_at(data: &[u8], at: usize) -> Option<u16> {
     data.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]))

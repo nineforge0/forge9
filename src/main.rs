@@ -130,6 +130,19 @@ enum Command {
         /// Entry index; `5/3` descends into nested RPF9s
         index: String,
     },
+    /// List textures in an RDS5 (.ttpf) store, or export one BC1 texture's mip 0
+    Texture {
+        store: PathBuf,
+        /// Write this texture as DDS
+        #[arg(long, conflicts_with = "decode")]
+        extract: Option<usize>,
+        /// Decode this texture to PNG
+        #[arg(long)]
+        decode: Option<usize>,
+        /// Output path (default: texture_<index>.dds / .png)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Create, verify and apply mod packs
     #[command(subcommand)]
     Mod(ModCommand),
@@ -183,6 +196,9 @@ fn main() -> Result<()> {
         println!("ok: {} replacement(s)", m.replace.len());
         return Ok(());
     }
+    if let Command::Texture { store, extract, decode, output } = &cli.command {
+        return cmd_texture(store, *extract, *decode, output.clone());
+    }
     let crypto = rpf9::crypto::CryptoContext::load(&cli.data_dir)
         .context("loading crypto data — set FORGE9_DATA or --data-dir")?;
 
@@ -210,7 +226,7 @@ fn main() -> Result<()> {
             let m = modding::manifest::Manifest::load(&manifest)?;
             modding::apply::apply(&m, archive.as_deref(), &crypto, &output)
         }
-        Command::Hash { .. } | Command::Mod(_) => unreachable!(),
+        Command::Hash { .. } | Command::Texture { .. } | Command::Mod(_) => unreachable!(),
     }
 }
 
@@ -477,5 +493,30 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
     let version = r.version.map_or(String::new(), |v| format!(" version {v:#x}"));
     println!("{:?} resource, {} bytes, magic {magic}{version}", r.kind, bytes.len());
     println!("  pointer-like words: {} virtual, {} physical", r.virtual_ptrs, r.physical_ptrs);
+    Ok(())
+}
+
+fn cmd_texture(path: &PathBuf, extract: Option<usize>, decode: Option<usize>, output: Option<PathBuf>) -> Result<()> {
+    use formats::texture;
+    let store = texture::Store::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let texs = store.textures()?;
+    if let Some(i) = extract.or(decode) {
+        let tex = texs.get(i).ok_or_else(|| anyhow::anyhow!("texture {i} out of range ({} textures)", texs.len()))?;
+        let png = decode.is_some();
+        let out = output.unwrap_or_else(|| PathBuf::from(format!("texture_{i}.{}", if png { "png" } else { "dds" })));
+        let (bytes, unfitted) = texture::export(&store, tex, png)?;
+        std::fs::write(&out, bytes)?;
+        println!("texture {i}: {}x{} mip 0 → {}", tex.width, tex.height, out.display());
+        if unfitted > 0 { println!("  warning: {unfitted} blocks use unfitted window slots and may be off"); }
+        return Ok(());
+    }
+    let mut codecs = std::collections::BTreeMap::new();
+    for c in &store.chunks { *codecs.entry(texture::codec_name(c.codec)).or_insert(0usize) += 1; }
+    let codecs: Vec<String> = codecs.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    println!("{}: {} chunks ({}), {} textures", path.display(), store.chunks.len(), codecs.join(", "), texs.len());
+    for t in &texs {
+        let array = if t.array_size > 1 { format!(" x{}", t.array_size) } else { String::new() };
+        println!("  #{:<5} {:>5}x{:<5}{array} {:<5} (dxgi {:>2}) mips {:>2} tile {}  hash {:016x}", t.index, t.width, t.height, texture::dxgi_name(t.dxgi), t.dxgi, t.mips, t.tile_mode, t.hash);
+    }
     Ok(())
 }

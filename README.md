@@ -13,6 +13,7 @@ RPF9 is a container format used by a well-known retail game engine. This tool ha
 - **Tree / search** nested RPF9 archives by magic, extension, size or content
 - **Replace / repack** entries in place or at any size, re-encrypting the TOC
 - **Decode payloads**: AWC audio streams, SGD5 shader databases, Bink 2 video headers, PSIN game data, paged resources
+- **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 textures to DDS or PNG
 - **Mod packs**: a TOML manifest of entry replacements, verified and applied in one command
 - **Hexdump** individual entries for analysis
 - **JSON output** for integration with other tools
@@ -65,6 +66,11 @@ forge9 bink archive.rpf 3
 forge9 psin script.rpf 0 --structs
 forge9 resource archive.rpf 7
 
+# Texture stores (.ttpf files sit next to the archives, not inside them)
+forge9 texture store.ttpf                       # list: size, format, mips, tile mode, hash
+forge9 texture store.ttpf --extract 12 -o a.dds # BC1 mip 0 as DDS
+forge9 texture store.ttpf --decode 12 -o a.png  # BC1 mip 0 as PNG
+
 # joaat hash of a name
 forge9 hash player_one
 ```
@@ -109,7 +115,8 @@ given (uncompressed); readers detect zlib per entry, so plain payloads read back
 | SGD5 shader database | `SGD5` | `shaders` | Record names, stages, tags, sizes; DXBC payload offsets |
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
 | Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
-| XML, DDS, PNG, GFX, RBF, RDS5 | various | `list` | Detected only |
+| RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; BCPack BC1 decode to DDS/PNG (mip 0) |
+| XML, DDS, PNG, GFX, RBF | various | `list` | Detected only |
 
 ## Architecture
 
@@ -130,6 +137,7 @@ src/
     sgd5.rs         SGD5 shader databases
     bink.rs         Bink 2 video headers
     resource.rs     0DRP paged resources
+    texture.rs      RDS5 texture stores (via bcpack-rs)
   modding/          mod packs
     manifest.rs     mod.toml format
     apply.rs        verify and apply against an archive
@@ -164,7 +172,8 @@ cargo build --release
 - [x] Mod pack manifests
 - [ ] Name recovery from larger hash dictionaries
 - [ ] PSIN binary-XML editor (read-modify-write values)
-- [ ] Texture decoders (BCPack / BCn)
+- [x] BCPack BC1 texture decoding
+- [ ] BCPack BC7 and full mip chains
 - [ ] Model export (glTF) from paged resources
 - [ ] Pipeline cache (PS09) parsing
 - [ ] Streaming world analysis tools
@@ -173,6 +182,12 @@ cargo build --release
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and the
 [good first issues](https://github.com/nineforge0/forge9/labels/good%20first%20issue).
+
+## Credits
+
+BCPack BC1 decoding, RDS5 parsing and Gfx10 detiling come from
+[bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) by Ahmet Dedeler (MIT OR Apache-2.0), whose
+rANS tables derive from Microsoft's MIT-licensed [silicon-rans](https://github.com/microsoft/silicon-rans).
 
 ## License
 
