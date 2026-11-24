@@ -15,7 +15,7 @@ RPF9 is a container format used by a well-known retail game engine. This tool ha
 - **Decode payloads**: AWC audio streams, SGD5 shader databases, Bink 2 video headers, PSIN game data, paged resources
 - **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 to DDS or PNG (fitted endpoint tables; output is approximate, see [bcpack-rs#4](https://github.com/Ahmet-Dedeler/bcpack-rs/issues/4)), and BCPack BC3/BC5/BC7 to DDS (DX10) or PNG, including array slices (bcpack-rs `bc5-bc7` branch; checked against the stored mip pyramid on all 129 BC3/BC5/BC7 chunks we have)
 - **Models**: export a drawable's LOD geometry (positions, indices, normals, up to two UV sets and the RGBA8 vertex attribute when present, plus one material per shader with its diffuse and normal textures embedded when they resolve in the `.ttpf` stores) to glTF 2.0 (`.glb`, or `.gltf` + `.bin`) or OBJ. Standalone drawables and drawable dictionaries; checked on a real drawable dictionary (see [docs/drawable_format.md](docs/drawable_format.md))
-- **Mod packs**: a TOML manifest of entry replacements, verified and applied in one command
+- **Mod packs**: TOML manifests of hash-guarded patches (text, XML, binary) to the user's own files, verified and applied in one command
 - **Hexdump** individual entries for analysis
 - **JSON output** for integration with other tools
 - **Library crate**: every decoder is usable from Rust as `forge9::formats::*`
@@ -136,32 +136,42 @@ forge9 --dict names.txt psin script.rpf 1 --structs
 
 ### Mod packs
 
-A mod is a `mod.toml` listing entry replacements. Paths are relative to the manifest.
+A mod is a `mod.toml` of **patches** applied to the user's own archive, so a published mod never
+contains game files. Each patch targets an entry by path (as `list --recursive` prints it), is
+guarded by the SHA-256 of the original inflated payload, and edits it with operations that check
+their own preconditions: exact text find/replace with a match count, XML element text or attribute
+set by path, and binary patch at an offset with the expected original bytes. Whole-file `file`
+replacement is for content the mod author created. Full spec: [docs/mod_format.md](docs/mod_format.md);
+example: [examples/xml-tweak](examples/xml-tweak).
 
 ```toml
 [mod]
 name = "example-mod"
 version = "0.1.0"
-description = "Example mod"
 target_archive = "common.rpf"
 
-[[replace]]
-entry = 6
-file = "mods/my_config.xml"
+[[patch]]
+path = "9"
+base_sha256 = "951e1174c3b64db0e0f40c02f4e6e1f9a3313580a510ac11bd5701d07033e789"
 
-[[replace]]
-entry = 12
-file = "mods/modified_data.bin"
+[[patch.op]]
+type = "xml"
+path = "CVehiclePoints/fNavMaxHeightChange"
+attr = "value"
+value = "0.400000"
 ```
 
 ```bash
 forge9 mod init                          # write a template mod.toml
-forge9 mod verify mod.toml               # files exist, indices in range, sizes sane
-forge9 mod apply mod.toml -o modded.rpf  # repack the target with every replacement
+forge9 mod verify mod.toml               # every guard and op checked, nothing written
+forge9 mod apply mod.toml -o modded.rpf  # repack the target with every patch
+forge9 diff common.rpf modded.rpf        # what changed
+forge9 mod make --path 9 original.xml edited.xml >> mod.toml   # ops from an edited extracted payload
 ```
 
-`verify` and `apply` take `--archive path.rpf` to override `target_archive`. Replacement bytes are stored as
-given (uncompressed); readers detect zlib per entry, so plain payloads read back as-is.
+`verify` and `apply` take `--archive path.rpf` to override `target_archive`, and refuse an archive whose
+entry does not match `base_sha256` (another game version, or already modded). v1 manifests
+(`[[replace]] entry = 6, file = ...`) still load as unguarded whole-file patches.
 
 ## Supported formats
 
@@ -208,6 +218,7 @@ src/
     texture.rs      RDS5 texture stores (via bcpack-rs)
   modding/          mod packs
     manifest.rs     mod.toml format
+    patch.rs        patch ops, XML value locator, `mod make`
     apply.rs        verify and apply against an archive
 ```
 

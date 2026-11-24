@@ -1,9 +1,14 @@
 [mod]
 name = "poc-ai-config"
-version = "0.1.0"
+version = "0.2.0"
 description = "Proof-of-concept mod: adds a comment to the AI lock controller config"
 target_archive = "common.rpf"
 
-[[replace]]
-entry = 6
-file = "mods/ai_lock_config.xml"
+[[patch]]
+path = "6"
+base_sha256 = "a1bed44d8fc0726be071a1d9187c8aab5f625a8c38dfb35242dc46bce218c76c"
+
+[[patch.op]]
+type = "text"
+find = "</LockPriority>\r\n"
+replace = "</LockPriority>\r\n\t<!-- Modified by forge9 proof-of-concept mod -->\r\n"
