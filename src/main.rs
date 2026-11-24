@@ -186,6 +186,12 @@ enum Command {
         /// EXEC-uniformity: share of vector instructions provably under a full EXEC (guard foldable), overall, per stage and for the N heaviest programs (default 30)
         #[arg(long, conflicts_with_all = ["summary", "shader", "heavy", "opcodes"], value_name = "N", num_args = 0..=1, default_missing_value = "30")]
         uniformity: Option<usize>,
+        /// Ray-traversal census: BVH intersect sites, their traversal-loop template and loop coverage (see docs/rt_traversal_census.md)
+        #[arg(long, conflicts_with_all = ["summary", "shader", "heavy", "opcodes", "uniformity"])]
+        rt_census: bool,
+        /// With --rt-census: JSON output
+        #[arg(long, requires = "rt_census")]
+        json: bool,
         /// With --opcodes: only programs of this hardware stage (LS HS ES GS VS PS CS MS)
         #[arg(long, requires = "opcodes")]
         stage: Option<String>,
@@ -377,9 +383,9 @@ fn main() -> Result<()> {
         Command::Shaders { archive, index, summary } => cmd_shaders(&load_entry(&archive, &crypto, &index)?, summary),
         Command::Pipelines { archive, index, mesh } => cmd_pipelines(&load_entry(&archive, &crypto, &index)?, mesh),
         Command::Fssm { archive, index, shader, roots } => cmd_fssm(&load_entry(&archive, &crypto, &index)?, shader, roots),
-        Command::Isa { archive, index, summary, shader, heavy, opcodes, uniformity, stage, dump } => {
+        Command::Isa { archive, index, summary, shader, heavy, opcodes, uniformity, rt_census, json, stage, dump } => {
             let bytes = load_entry(&archive, &crypto, &index)?;
-            if let Some(n) = uniformity { cmd_isa_uniformity(&bytes, n) } else if opcodes { cmd_isa_opcodes(&bytes, stage.as_deref()) } else { cmd_isa(&bytes, summary, shader, heavy, dump.as_deref()) }
+            if rt_census { cmd_isa_rt_census(&bytes, json) } else if let Some(n) = uniformity { cmd_isa_uniformity(&bytes, n) } else if opcodes { cmd_isa_opcodes(&bytes, stage.as_deref()) } else { cmd_isa(&bytes, summary, shader, heavy, dump.as_deref()) }
         }
         Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
@@ -1193,6 +1199,89 @@ fn cmd_isa_uniformity(bytes: &[u8], top: usize) -> Result<()> {
         println!("  {insts:>7} {:>7} {:>7.1}% {:>7.1}% {:>10} {:>9.1}  {stage} {}  {name}",
             u.vector, pct(u), 100.0 - pct(u), u.guard_runs, per_run(u), if *w32 { "w32" } else { "w64" });
     }
+    Ok(())
+}
+
+/// BVH intersect sites per program, their traversal template and innermost-loop coverage.
+fn cmd_isa_rt_census(bytes: &[u8], json: bool) -> Result<()> {
+    use formats::rdna2::Family;
+    use formats::rt_census::{census, Census, PUSH_WINDOW, SORT_WINDOW};
+    use std::collections::BTreeMap;
+    let records = formats::sgd5::parse(bytes)?;
+    // (insts, stage, name, census of programs with a site)
+    let mut all: Vec<(u32, &str, &str, Option<Census>)> = Vec::new();
+    let mut stages: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut failed = 0;
+    for rec in &records {
+        let Ok(progs) = record_code(bytes, rec) else { failed += 1; continue };
+        for (s, code) in progs {
+            let st = formats::rdna2::analyze(&code);
+            *stages.entry(s.name()).or_default() += 1;
+            let bvh = st.opcodes.contains_key(&(Family::Mimg, 0xe6)) || st.opcodes.contains_key(&(Family::Mimg, 0xe7));
+            all.push((st.insts, s.name(), &rec.name, bvh.then(|| census(&code, s.wave32))));
+        }
+    }
+    let hits: Vec<_> = all.iter().filter_map(|(n, st, name, c)| c.as_ref().map(|c| (*n, *st, *name, c))).collect();
+    let count = |f: &dyn Fn(&formats::rt_census::Site) -> bool| hits.iter().map(|h| h.3.sites.iter().filter(|s| f(s)).count()).sum::<usize>();
+    let progs = |b64: bool| hits.iter().filter(|h| h.3.sites.iter().any(|s| s.bvh64 == b64)).count();
+    let sites = count(&|_| true);
+    let insts: u64 = hits.iter().map(|h| h.0 as u64).sum();
+    let in_loop: u64 = hits.iter().map(|h| h.3.in_loop as u64).sum();
+    let template = |s: &formats::rt_census::Site| s.sort && s.push.is_some() && s.ring.is_some() && s.node_type && s.loop_span.is_some();
+    let mut checks: Vec<(String, usize)> = vec![
+        ("sort".into(), count(&|s| s.sort)), ("push".into(), count(&|s| s.push.is_some())),
+        ("push_ds_write_b32".into(), count(&|s| s.push == Some("ds_write_b32"))), ("push_ds_write2_b32".into(), count(&|s| s.push == Some("ds_write2_b32"))),
+        ("ring".into(), count(&|s| s.ring.is_some())),
+    ];
+    let mut masks: BTreeMap<u32, usize> = BTreeMap::new();
+    for h in &hits { for m in h.3.sites.iter().filter_map(|s| s.ring) { *masks.entry(m).or_default() += 1; } }
+    checks.extend(masks.iter().map(|(m, n)| (format!("ring_{m:#x}"), *n)));
+    checks.extend([
+        ("node_type".into(), count(&|s| s.node_type)), ("cap".into(), count(&|s| s.cap)), ("loop".into(), count(&|s| s.loop_span.is_some())),
+        ("template".into(), count(&template)), ("template_programs".into(), hits.iter().filter(|h| h.3.sites.iter().all(template)).count()),
+    ]);
+    let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+    let mut by_size: Vec<_> = all.iter().collect();
+    by_size.sort_by(|a, b| b.0.cmp(&a.0));
+    let site_count = |c: &Option<Census>| c.as_ref().map_or(0, |c| c.sites.len());
+    if json {
+        let q = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let stages: Vec<String> = stages.iter().map(|(s, n)| format!("\"{s}\":{n}")).collect();
+        let checks: Vec<String> = checks.iter().map(|(k, n)| format!("\"{k}\":{n}")).collect();
+        let rows: Vec<String> = hits.iter().map(|(n, st, name, c)| {
+            let b64 = c.sites.iter().filter(|s| s.bvh64).count();
+            format!("{{\"name\":\"{}\",\"stage\":\"{st}\",\"insts\":{n},\"bvh\":{},\"bvh64\":{b64},\"in_loop\":{},\"template\":{},\"cap\":{}}}",
+                q(name), c.sites.len() - b64, c.in_loop, c.sites.iter().filter(|s| template(s)).count(), c.sites.iter().filter(|s| s.cap).count())
+        }).collect();
+        let heavy: Vec<String> = by_size.iter().take(10).map(|(n, st, name, c)| format!("{{\"name\":\"{}\",\"stage\":\"{st}\",\"insts\":{n},\"sites\":{}}}", q(name), site_count(c))).collect();
+        println!("{{\"records\":{},\"unreadable\":{failed},\"programs\":{},\"stages\":{{{}}},", records.len(), all.len(), stages.join(","));
+        println!(" \"sites\":{sites},\"bvh_sites\":{},\"bvh_programs\":{},\"bvh64_sites\":{},\"bvh64_programs\":{},\"programs_with_sites\":{},",
+            count(&|s| !s.bvh64), progs(false), count(&|s| s.bvh64), progs(true), hits.len());
+        println!(" \"insts\":{insts},\"in_loop\":{in_loop},\"windows\":{{\"sort\":{SORT_WINDOW},\"push\":{PUSH_WINDOW}}},\"checks\":{{{}}},", checks.join(","));
+        println!(" \"by_program\":[{}],", rows.join(","));
+        println!(" \"heaviest\":[{}]}}", heavy.join(","));
+        return Ok(());
+    }
+    println!("{} records ({failed} without a readable FSSM program), {} programs ({})", records.len(), all.len(),
+        stages.iter().map(|(s, n)| format!("{s} {n}")).collect::<Vec<_>>().join(", "));
+    println!("{sites} BVH intersect sites in {} programs: image_bvh_intersect_ray {} in {} programs, image_bvh64_intersect_ray {} in {} programs",
+        hits.len(), count(&|s| !s.bvh64), progs(false), count(&|s| s.bvh64), progs(true));
+    println!("per site: sort = v_min3/v_med3/v_max3_u32 within {SORT_WINDOW} instructions after; push = ds_write_b32 or ds_write2_b32 and ring = v_and_b32 with mask 4*(2^k-1) within {PUSH_WINDOW} after;");
+    println!("  loop = innermost backward branch around it; node_type = v_and_b32 .., 7 in that loop; cap = s_cmpk_lt_u32 sN, 0xffff in that loop; template = sort+push+ring+node_type+loop");
+    let (last, per_site) = checks.split_last().unwrap();
+    for (k, n) in per_site { println!("  {k:<18} {n:>6} of {sites} sites ({:.1}%)", pct(*n as u64, sites as u64)); }
+    println!("  {} of {} programs have every site on the template", last.1, hits.len());
+    println!("{insts} instructions in these programs, {in_loop} ({:.1}%) in an innermost loop around a site", pct(in_loop, insts));
+    println!("  {:>7} {:>5} {:>5} {:>7} {:>8} {:>4}  stage  shader", "insts", "bvh", "bvh64", "in loop", "template", "cap");
+    let mut rows = hits.clone();
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    for (n, st, name, c) in rows {
+        let b64 = c.sites.iter().filter(|s| s.bvh64).count();
+        println!("  {n:>7} {:>5} {b64:>5} {:>6.1}% {:>8} {:>4}  {st}  {name}", c.sites.len() - b64, pct(c.in_loop as u64, n as u64),
+            c.sites.iter().filter(|s| template(s)).count(), c.sites.iter().filter(|s| s.cap).count());
+    }
+    println!("10 heaviest programs:");
+    for (n, st, name, c) in by_size.iter().take(10) { println!("  {n:>7} {:>4} sites  {st}  {name}", site_count(c)); }
     Ok(())
 }
 

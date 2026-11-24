@@ -186,7 +186,7 @@ fn exec_of(r: &Regs, wave32: bool) -> M {
 
 /// Target of `s_getpc_b64 s[a:b]; s_add_u32 sa, sa, lit; s_addc_u32 sb, sb, 0; s_setpc_b64 s[a:b]`
 /// ending at `at`: the compiler's branch for offsets past the 16-bit `simm` of `s_branch`.
-fn long_jump(code: &[u8], at: usize) -> Option<usize> {
+pub(crate) fn long_jump(code: &[u8], at: usize) -> Option<usize> {
     let dw = |at: usize| code.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let op = |at: usize| decode(code.get(at..)?).and_then(|i| opcode_name(i.family, i.op));
     let (setpc, getpc, add) = (dw(at)?, dw(at.checked_sub(16)?)?, dw(at - 12)?);
