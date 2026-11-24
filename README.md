@@ -136,6 +136,8 @@ forge9 --dict names.txt psin script.rpf 1 --structs
 
 ### Mod packs
 
+Published mods live in [forge9-mods](https://github.com/nineforge0/forge9-mods).
+
 A mod is a `mod.toml` of **patches** applied to the user's own archive, so a published mod never
 contains game files. Each patch targets an entry by path (as `list --recursive` prints it), is
 guarded by the SHA-256 of the original inflated payload, and edits it with operations that check
