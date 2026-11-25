@@ -49,20 +49,17 @@ impl<'a> Archive<'a> {
             bail!("no table records recovered with any key");
         }
         if compact {
-            let entries = entry::parse_compact(&plain, start, run);
+            let mut entries = entry::parse_compact(&plain, start, run);
+            name(&mut entries, &entry::name_hashes(&plain, start, true));
             return Ok(Self { data, header, entries, key_index: best_key });
         }
         let skip = if declared > 0 && run == declared + 1 { 1 } else { 0 };
         let count = if declared == 0 { run } else { declared.min(run) };
         let trailer = header.trailer_size as u64;
         let archive_end = (data.len() as u64).saturating_sub(trailer);
-        let entries = entry::parse(
-            &plain,
-            start + skip * entry::RECORD,
-            run.saturating_sub(skip),
-            count,
-            archive_end,
-        );
+        let table_at = start + skip * entry::RECORD;
+        let mut entries = entry::parse(&plain, table_at, run.saturating_sub(skip), count, archive_end);
+        name(&mut entries, &entry::name_hashes(&plain, table_at, false));
 
         Ok(Self { data, header, entries, key_index: best_key })
     }
@@ -108,6 +105,11 @@ impl<'a> Archive<'a> {
             Ok(vec![raw.to_vec()])
         }
     }
+}
+
+/// Sets each entry's name hash from the column; 0 is a placeholder (joaat of ""), not a name.
+fn name(entries: &mut [Entry], hashes: &[u32]) {
+    for e in entries { e.name_hash = hashes.get(e.index).copied().filter(|&h| h != 0); }
 }
 
 /// A payload stored as `raw`, as `read_entry` returns it.
