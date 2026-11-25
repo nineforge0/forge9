@@ -215,6 +215,18 @@ pub fn page_counts(sys: &[u8]) -> Option<(u8, u8)> {
     Some((c[0], c[1]))
 }
 
+/// The embedded names (header +0xA8) of a drawable, or of each drawable of a drawable
+/// dictionary, from its entry content; empty for anything else.
+pub fn labels(sys: &[u8]) -> Vec<String> {
+    let members = match dictionary(sys) {
+        Some(m) => m,
+        None if looks_like(sys) => vec![0],
+        None => return Vec::new(),
+    };
+    let r = Res { sys, gfx: &[] };
+    members.iter().filter_map(|&at| r.name(at + 168).ok()).collect()
+}
+
 /// Decodes a drawable, or every drawable of a drawable dictionary (merged,
 /// mesh names prefixed by drawable name), from the inflated blocks of its
 /// entry: system blocks first, then graphics. The page map's declared system
@@ -832,6 +844,9 @@ mod tests {
         let blocks = synthetic(true);
         assert!(!looks_like(&blocks[0]) && dictionary(&blocks[0]) == Some(vec![64]));
         assert_eq!(page_counts(&blocks[0]), Some((1, 1)));
+        assert_eq!(labels(&blocks.concat()), ["synthetic_prop"]);
+        assert_eq!(labels(&synthetic(false).concat()), ["synthetic_prop"]);
+        assert!(labels(&blocks[1]).is_empty());
         let d = parse_blocks(&blocks, 0).unwrap();
         assert_eq!((d.meshes.len(), d.skipped.len()), (2, 1));
         assert_eq!(d.meshes[0].name, "synthetic_prop/model_0_geometry_0");

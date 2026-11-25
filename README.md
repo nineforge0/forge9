@@ -166,12 +166,14 @@ forge9 harvest script.rpf common.rpf > names.txt
 forge9 --dict names.txt psin script.rpf 1 --structs
 
 # Entry catalog across archives (nested RPF9s included): one row per entry with its id
-# (`archive:path`, plus `@hash` when the record carries a name hash), kind, stored and inflated size,
-# and its name from the dictionary, else candidate names from archive strings whose joaat matches
-# (a 32-bit match can be a coincidence), else unresolved. No TOC layout read so far has a field
-# known to hold a name hash, so for now every entry is addressed by path and listed as unresolved.
+# (`archive:path`, plus `@hash` when the TOC has a name hash for it), kind, stored and inflated size,
+# and its name: from the dictionary, else the embedded label of a drawable or drawable dictionary,
+# else candidate names from archive strings whose joaat matches (a 32-bit match can be a
+# coincidence), else unresolved. The name hash is the joaat of the entry name, read from
+# the TOC's u32 name hash column, a column beside the records rather than a record field; some
+# archives have no such column, or one shorter than their records.
 forge9 --dict names.txt catalog common.rpf script.rpf
-forge9 catalog common.rpf --json             # array of {id, archive, path, hash, kind, stored, inflated, status, name, candidates}
+forge9 catalog common.rpf --json             # array of {id, archive, path, hash, kind, stored, inflated, status, name, evidence, candidates}
 ```
 
 ### Mod packs
@@ -243,7 +245,7 @@ src/
   rpf9/             the archive container
     header.rs       fixed header
     crypto.rs       T-table cipher, key schedules, CBC
-    entry.rs        TOC records (indexed and stored layouts)
+    entry.rs        TOC records (indexed, stored and compact layouts), name hash column
     reader.rs       Archive::open with key discovery, entry reads, format sniffing
     writer.rs       in-place replace and full repack
     psin.rs         PSIN / PSO data

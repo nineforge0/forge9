@@ -10,6 +10,8 @@ pub struct Entry {
     pub size_hint: u32,
     pub aux: u32,
     pub flags: u32,
+    /// joaat of the entry's name, from the TOC's name hash column (see `name_hashes`).
+    pub name_hash: Option<u32>,
     pub raw: [u8; RECORD],
 }
 
@@ -17,10 +19,6 @@ impl Entry {
     pub fn is_zlib(&self, data: &[u8]) -> bool {
         data.get(self.offset as usize..).is_some_and(zlib_head)
     }
-
-    /// The joaat name hash stored in the record. None of the three layouts read so far has a field
-    /// known to hold one, so this is `None` until such a field is identified.
-    pub fn name_hash(&self) -> Option<u32> { None }
 
     pub fn payload_magic(&self, data: &[u8]) -> Option<[u8; 4]> {
         let off = self.offset as usize;
@@ -118,6 +116,30 @@ pub fn detect_compact(plain: &[u8], data: &[u8], data_start: u64) -> Option<(usi
         .map(|s| (s, count))
 }
 
+/// Column ids in the TOC's column directory, whose descriptors are `{u64 id, u32 count, u32 offset,
+/// u64 stride}` with offsets from one shared base: the 24-byte records, the 20-byte records
+/// (`COMPACT_SECTION`) and the u32 name hashes, one per record index. A u64 column (id
+/// 0x73bcb72dce74f11f) holds a further per-record value whose hash function is not identified.
+const RECORDS: u64 = 0x33f7_0dfa_f2c5_0989;
+const NAME_HASHES: u64 = 0xb707_6b62_45d3_5fb5;
+
+/// `(count, offset, stride)` of column `id`.
+fn column(plain: &[u8], id: u64) -> Option<(usize, usize, u64)> {
+    let at = plain.windows(8).position(|w| w == id.to_le_bytes())?;
+    let d = plain.get(at + 8..at + 24)?;
+    let word = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap()) as usize;
+    Some((word(0), word(4), u64::from_le_bytes(d[8..16].try_into().unwrap())))
+}
+
+/// The name hash column, indexed like the records that start at `table_at`. Some archives
+/// declare fewer hashes than records; the records past the column have none.
+pub fn name_hashes(plain: &[u8], table_at: usize, compact: bool) -> Vec<u32> {
+    let records = if compact { u64::from_le_bytes(COMPACT_SECTION) } else { RECORDS };
+    let (Some((_, rec_off, _)), Some((count, off, 4))) = (column(plain, records), column(plain, NAME_HASHES)) else { return Vec::new() };
+    let Some(at) = (table_at + off).checked_sub(rec_off) else { return Vec::new() };
+    plain.get(at..at + count * 4).map_or(Vec::new(), |b| b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+}
+
 fn compact_fields(bytes: &[u8]) -> ([u32; 5], u64, u64) {
     let w: [u32; 5] = std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()));
     (w, u64::from(w[2]), u64::from(w[3]))
@@ -137,6 +159,7 @@ pub fn parse_compact(plain: &[u8], table_at: usize, count: usize) -> Vec<Entry> 
                 size_hint: w[0],
                 aux: w[4],
                 flags: w[1],
+                name_hash: None,
                 raw,
             }
         })
@@ -160,6 +183,7 @@ pub fn parse(plain: &[u8], table_at: usize, run: usize, count: usize, end: u64) 
             size_hint: word(0),
             aux: word(16),
             flags: word(12),
+            name_hash: None,
             raw,
         });
     }
@@ -233,6 +257,26 @@ mod tests {
         assert_eq!(detect_compact(&plain, &data[..0xc000], 0x2b0), None);
         let entries = parse_compact(&plain, 0x30, 1);
         assert_eq!((entries[0].offset, entries[0].size, entries[0].aux), (0x1010, 0xb5d0, 4));
+    }
+
+    #[test]
+    fn name_hashes_follow_the_column_directory() {
+        // story000_restofworld.rpf nested #1 shape: directory, then records and hashes at offsets
+        // from a shared base (here 0x100, records at base + 0x40, hashes at base + 0x20).
+        let mut plain = vec![0u8; 0x200];
+        for (i, (id, count, off, stride)) in [(NAME_HASHES, 2u32, 0x20u32, 4u64), (u64::from_le_bytes(COMPACT_SECTION), 3, 0x40, 20)].into_iter().enumerate() {
+            let d = 0x10 + i * 24;
+            plain[d..d + 8].copy_from_slice(&id.to_le_bytes());
+            plain[d + 8..d + 12].copy_from_slice(&count.to_le_bytes());
+            plain[d + 12..d + 16].copy_from_slice(&off.to_le_bytes());
+            plain[d + 16..d + 24].copy_from_slice(&stride.to_le_bytes());
+        }
+        plain[0x120..0x128].copy_from_slice(&[0x8b, 0x28, 0xf2, 0xd1, 0xcc, 0x4d, 0x93, 0x24]);
+        assert_eq!(name_hashes(&plain, 0x140, true), [0xd1f2_288b, 0x2493_4dcc]);
+        // No 24-byte records directory, so nothing for the indexed layout.
+        assert!(name_hashes(&plain, 0x140, false).is_empty());
+        plain[0x10..0x18].fill(0);
+        assert!(name_hashes(&plain, 0x140, true).is_empty());
     }
 
     #[test]
