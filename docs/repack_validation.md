@@ -4,9 +4,10 @@ What forge9's `repack` output has been checked against, and what is still
 unproven. Short version: an RPF9 reader that forge9 did not write parses
 forge9's repacked archives and reads every entry back correctly. Unchanged
 archives repack **byte-identically**. **No repacked archive has been shown to
-load in the game.** A static read of the game executable finds no archive
-integrity or signature check in the RPF9 load path (see Game loader), which
-removes the main structural objection but does not prove a live load.
+load in the game.** The headers carry RSA signatures, but a static read of the
+game executable finds no code that enforces them (or any hash) on the RPF9 load
+path (see Game loader), which weakens the main structural objection but does not
+prove a live load.
 
 ## Reader used
 
@@ -66,12 +67,16 @@ data start to 4 KiB, and packed entries at 16-byte alignment. As a result:
 The writer now keeps the original physical order and each entry's original
 alignment (capped at 4 KiB), and it copies the original header bytes.
 
-## Game loader: no archive integrity check found
+## Game loader: no signature enforcement found
 
-A static analysis of the game executable (PE x86-64, ImageBase `0x140000000`;
-the game was not run) traced the code that reads the RPF9 magic and header. The
-loader validates only the 4-byte magic `9FPR` and then allocates and
-stream-reads the header and TOC. Evidence:
+The RPF9 headers do carry signatures: `rpf9-explorer`'s format notes report
+RSA-2048 PKCS#1 v1.5 signatures over selected header ranges, verified offline
+across 22 standalone and 4,351 child headers. The open question for modding is
+whether the game *enforces* them at load. A static analysis of the game
+executable (PE x86-64, ImageBase `0x140000000`; the game was not run) traced the
+code that reads the RPF9 magic and header. The loader validates only the 4-byte
+magic `9FPR` and then allocates and stream-reads the header and TOC. No
+signature or hash check was found on that path. Evidence:
 
 - The only `bcrypt` imports are `BCryptGenRandom/Open/Close` (an RNG). There is
   no `BCryptCreateHash`/`HashData`/`FinishHash`/`VerifySignature`, no NCrypt and
@@ -85,12 +90,13 @@ stream-reads the header and TOC. Evidence:
   to web-token verification, not to archive loading. No archive-integrity string
   exists.
 
-So on this executable the only gate on a repacked archive is the TOC block
-cipher: a correctly re-encrypted TOC (which forge9 produces) decrypts to valid
-records. This contradicts `rpf9-explorer`'s "RSA-2048 over header ranges" claim
-for this build. The result is a static negative on a vtable-heavy loader: not
-every virtual call in the mount path was resolved, so it is strong evidence, not
-a proof.
+So the header signatures are real, but on this executable no code was found that
+checks them when an archive loads: the only gate observed is the TOC block
+cipher, which forge9 re-encrypts exactly. The result is a static negative on a
+vtable-heavy loader: not every virtual call in the mount path was resolved, so it
+is strong evidence that the signatures are not enforced here, not a proof. A
+runtime test (a resigned-or-not repacked archive loading in a running build) is
+still needed to confirm it.
 
 ## Self-check: `--verify`
 
@@ -129,8 +135,9 @@ loads the archive.
 The evidence supports this claim: *forge9's repacked archives are
 structurally valid RPF9 files that a separate RPF9 implementation accepts and
 reads back correctly, and unchanged archives round-trip byte-identically.* The
-static read of the game loader removes the header-signature objection for this
-build: no archive hash or signature check was found. It does **not** support
+static read of the game loader weakens the header-signature objection for this
+build: the headers are signed, but no code enforcing a signature or hash was
+found on the load path. It does **not** support
 removing the disclaimer "repacked archives are not shown running in the game":
 format-correctness fields forge9 does not model, and a live load, are still
 untested.
