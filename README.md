@@ -4,6 +4,8 @@ General-purpose toolkit for RPF9 archives. Read, decrypt, inspect, extract and a
 
 RPF9 is a container format used by a well-known retail game engine. This tool handles decryption, TOC parsing, entry listing, content extraction, and format detection: a foundation for research, interoperability work and asset tooling.
 
+**Format reference:** [docs/rpf9_format.md](docs/rpf9_format.md), the RPF9 container spec (header, encryption, TOC columns, record layouts, names, compression), with what is known and what is still unknown.
+
 ## Scope and provenance
 
 forge9 is an independent, interoperability-oriented implementation of the RPF9
@@ -220,9 +222,11 @@ entry does not match `base_sha256` (another game version, or already modded). v1
 
 ## Supported formats
 
+Container spec: [docs/rpf9_format.md](docs/rpf9_format.md). Payload formats link their own documents below.
+
 | Format | Magic | Command | Status |
 |---|---|---|---|
-| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `catalog`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
+| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `catalog`, `extract`, `repack` | Read and write; TOC decrypt/encrypt; spec: [docs/rpf9_format.md](docs/rpf9_format.md) |
 | zlib chains | `78 xx` | (automatic) | Inflated on read |
 | PSIN / PSO game data | `PSIN` | `psin`, `harvest` | Block table, struct schemas; schema hash names from archive strings |
 | AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
