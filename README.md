@@ -164,6 +164,16 @@ forge9 hash player_one
 # Grow the hash dictionary: name unknown PSIN schema hashes from strings found in the archives
 forge9 harvest script.rpf common.rpf > names.txt
 forge9 --dict names.txt psin script.rpf 1 --structs
+
+# Entry catalog across archives (nested RPF9s included): one row per entry with its id
+# (`archive:path`, plus `@hash` when the TOC has a name hash for it), kind, stored and inflated size,
+# and its name: from the dictionary, else the embedded label of a drawable or drawable dictionary,
+# else candidate names from archive strings whose joaat matches (a 32-bit match can be a
+# coincidence), else unresolved. The name hash is the joaat of the entry name, read from
+# the TOC's u32 name hash column, a column beside the records rather than a record field; some
+# archives have no such column, or one shorter than their records.
+forge9 --dict names.txt catalog common.rpf script.rpf
+forge9 catalog common.rpf --json             # array of {id, archive, path, hash, kind, stored, inflated, status, name, evidence, candidates}
 ```
 
 ### Mod packs
@@ -212,7 +222,7 @@ entry does not match `base_sha256` (another game version, or already modded). v1
 
 | Format | Magic | Command | Status |
 |---|---|---|---|
-| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
+| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `catalog`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
 | zlib chains | `78 xx` | (automatic) | Inflated on read |
 | PSIN / PSO game data | `PSIN` | `psin`, `harvest` | Block table, struct schemas; schema hash names from archive strings |
 | AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
@@ -235,7 +245,7 @@ src/
   rpf9/             the archive container
     header.rs       fixed header
     crypto.rs       T-table cipher, key schedules, CBC
-    entry.rs        TOC records (indexed and stored layouts)
+    entry.rs        TOC records (indexed, stored and compact layouts), name hash column
     reader.rs       Archive::open with key discovery, entry reads, format sniffing
     writer.rs       in-place replace and full repack
     psin.rs         PSIN / PSO data

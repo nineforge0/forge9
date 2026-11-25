@@ -54,6 +54,13 @@ enum Command {
         #[arg(required = true)]
         archives: Vec<PathBuf>,
     },
+    /// Catalog every entry (with nested RPF9s) of the archives: path, name hash, name or candidates, kind, sizes
+    Catalog {
+        #[arg(required = true)]
+        archives: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Extract entries to a directory
     Extract {
         archive: PathBuf,
@@ -429,6 +436,7 @@ fn main() -> Result<()> {
             Err(e) => { eprintln!("Error: {e:?}"); std::process::exit(2) }
         },
         Command::Harvest { archives } => cmd_harvest(&archives, &crypto, &dict),
+        Command::Catalog { archives, json } => cmd_catalog(&archives, &crypto, &dict, json),
         Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
@@ -758,18 +766,107 @@ fn harvest(archives: &[rpf9::reader::Archive], crypto: &rpf9::crypto::CryptoCont
     // 0 and 0x100 (anonymous array item) are placeholders, not names.
     targets.retain(|&h| h > 0x100 && dict.name(h).is_none());
     let mut found = std::collections::BTreeMap::new();
-    for archive in archives { walk(archive, "", crypto, &mut |_, a, e, nested| {
+    for archive in archives { scan_words(archive, crypto, &mut |_, w, h| {
+        if targets.contains(&h) { found.entry(h).or_insert_with(|| w.to_string()); }
+    })?; }
+    Ok((targets.len(), found))
+}
+
+/// Calls `f(path, word, joaat)` for every identifier-like string (`[A-Za-z0-9_]{3,64}`, as found
+/// and lowercased) in the entries that are not nested archives.
+fn scan_words(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext, f: &mut dyn FnMut(&str, &str, u32)) -> Result<()> {
+    walk(archive, "", crypto, &mut |path, a, e, nested| {
         if nested { return; }
         let bytes = content(a, e);
         for word in bytes.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_')).filter(|w| (3..=64).contains(&w.len())) {
             let word = std::str::from_utf8(word).unwrap();
-            for w in [word.to_string(), word.to_ascii_lowercase()] {
-                let h = rpf9::hashes::joaat(&w);
-                if targets.contains(&h) { found.entry(h).or_insert(w); }
-            }
+            for w in [word.to_string(), word.to_ascii_lowercase()] { f(path, &w, rpf9::hashes::joaat(&w)); }
         }
+    })
+}
+
+/// One entry of `catalog`: `name` from the dictionary or the embedded resource label (`evidence`
+/// says which), else `candidates` as (name, evidence).
+#[derive(Debug, Clone)]
+struct CatalogRow { archive: String, path: String, hash: Option<u32>, ext: &'static str, stored: u64, inflated: u64,
+    name: Option<String>, evidence: &'static str, candidates: Vec<(String, String)> }
+
+impl CatalogRow {
+    /// What an author targets: `archive:path`, plus `@hash` when the record carries one.
+    fn id(&self) -> String {
+        let hash = self.hash.map(|h| format!("@{h:#010x}")).unwrap_or_default();
+        format!("{}:{}{hash}", self.archive, self.path)
+    }
+    fn status(&self) -> &'static str {
+        if self.name.is_some() { "resolved" } else if self.candidates.is_empty() { "unresolved" } else { "candidate" }
+    }
+}
+
+/// Every entry of the (file name, archive) pairs, nested archives and their entries included, named
+/// only by the embedded label of drawables and drawable dictionaries.
+fn catalog(archives: &[(String, rpf9::reader::Archive)], crypto: &rpf9::crypto::CryptoContext) -> Result<Vec<CatalogRow>> {
+    let mut rows = Vec::new();
+    for (name, archive) in archives { walk(archive, "", crypto, &mut |path, a, e, nested| {
+        let zlib = e.is_zlib(a.data());
+        let bytes = if nested && !zlib { Vec::new() } else { content(a, e) };
+        let inflated = if zlib { bytes.len() as u64 } else { e.size };
+        let labels = if nested { Vec::new() } else { formats::drawable::labels(&bytes) };
+        rows.push(CatalogRow { archive: name.clone(), path: path.to_string(), hash: e.name_hash, ext: a.sniff(e), stored: e.size,
+            inflated, name: (!labels.is_empty()).then(|| labels.join(", ")), evidence: "embedded resource label", candidates: Vec::new() });
     })?; }
-    Ok((targets.len(), found))
+    Ok(rows)
+}
+
+/// Names each row's hash from `dict` (over an embedded label), else, for a row still unnamed, lists as
+/// candidates the strings in `archives` whose joaat matches it. A 32-bit match can be a coincidence,
+/// so candidates stay candidates.
+fn name_rows(rows: &mut [CatalogRow], archives: &[(String, rpf9::reader::Archive)], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict) -> Result<()> {
+    for r in rows.iter_mut() {
+        if let Some(n) = r.hash.and_then(|h| dict.name(h)) { (r.name, r.evidence) = (Some(n.to_string()), "dictionary"); }
+    }
+    let targets: std::collections::HashSet<u32> = rows.iter().filter(|r| r.name.is_none()).filter_map(|r| r.hash).collect();
+    if targets.is_empty() { return Ok(()); }
+    let mut found: std::collections::HashMap<u32, Vec<(String, String)>> = Default::default();
+    for (name, archive) in archives { scan_words(archive, crypto, &mut |path, w, h| {
+        if !targets.contains(&h) { return; }
+        let c = found.entry(h).or_default();
+        if !c.iter().any(|(n, _)| n == w) { c.push((w.to_string(), format!("string in entry {name}:{path}"))); }
+    })?; }
+    for r in rows.iter_mut().filter(|r| r.name.is_none()) {
+        if let Some(c) = r.hash.and_then(|h| found.get(&h)) { r.candidates = c.clone(); }
+    }
+    Ok(())
+}
+
+fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool) -> Result<()> {
+    let raws = paths.iter().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
+    let archives = paths.iter().zip(&raws).map(|(p, r)| Ok((p.file_name().unwrap_or_default().to_string_lossy().into_owned(), rpf9::reader::Archive::open(r, crypto)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut rows = catalog(&archives, crypto)?;
+    name_rows(&mut rows, &archives, crypto, dict)?;
+    if json {
+        let records: Vec<_> = rows.iter().map(|r| serde_json::json!({
+            "id": r.id(), "archive": r.archive, "path": r.path, "hash": r.hash.map(|h| format!("{h:#010x}")),
+            "kind": r.ext, "stored": r.stored, "inflated": r.inflated, "status": r.status(), "name": r.name, "evidence": r.name.as_ref().map(|_| r.evidence),
+            "candidates": r.candidates.iter().map(|(n, ev)| serde_json::json!({"name": n, "evidence": ev, "confidence": "exact hash match"})).collect::<Vec<_>>(),
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&records)?);
+        return Ok(());
+    }
+    println!("  {:<28} {:<10} {:<6} {:>12} {:>12}  name", "id", "hash", "kind", "stored", "inflated");
+    for r in &rows {
+        let name = match (&r.name, r.candidates.as_slice()) {
+            (Some(n), _) => format!("{n} ({})", r.evidence),
+            (None, []) => "(unresolved)".into(),
+            (None, c) => c.iter().map(|(n, ev)| format!("{n}? ({ev}, exact hash match)")).collect::<Vec<_>>().join(", "),
+        };
+        let hash = r.hash.map_or("-".into(), |h| format!("{h:#010x}"));
+        println!("  {:<28} {hash:<10} .{:<5} {:>12} {:>12}  {name}", r.id(), r.ext, r.stored, r.inflated);
+    }
+    let count = |s| rows.iter().filter(|r| r.status() == s).count();
+    println!("{} entries: {} resolved, {} candidate, {} unresolved ({} without a name hash)",
+        rows.len(), count("resolved"), count("candidate"), count("unresolved"), rows.iter().filter(|r| r.hash.is_none()).count());
+    Ok(())
 }
 
 fn cmd_harvest(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict) -> Result<()> {
@@ -1767,8 +1864,19 @@ mod tests {
     }
 
     /// An archive of `payloads` in the stored record layout `{offset/16, ceil(size/16), size}`.
-    fn archive(crypto: &CryptoContext, payloads: &[Vec<u8>]) -> Vec<u8> {
-        let mut toc = vec![0u8; (payloads.len() * 24 + 16).next_multiple_of(16)];
+    fn archive(crypto: &CryptoContext, payloads: &[Vec<u8>]) -> Vec<u8> { named_archive(crypto, payloads, &[]) }
+
+    /// `archive`, with a TOC column directory placing `names` as the name hash column after the records.
+    fn named_archive(crypto: &CryptoContext, payloads: &[Vec<u8>], names: &[u32]) -> Vec<u8> {
+        let records = payloads.len() * 24;
+        let mut toc = vec![0u8; records];
+        if !names.is_empty() {
+            for (id, count, off, stride) in [(0x33f7_0dfa_f2c5_0989u64, payloads.len(), 0, 24u64), (0xb707_6b62_45d3_5fb5, names.len(), records + 48, 4)] {
+                toc.extend([id.to_le_bytes(), ((count as u64) | (off as u64) << 32).to_le_bytes(), stride.to_le_bytes()].concat());
+            }
+            toc.extend(names.iter().flat_map(|h| h.to_le_bytes()));
+        }
+        toc.resize((toc.len() + 16).next_multiple_of(16), 0);
         let mut data = Vec::new();
         for (i, p) in payloads.iter().enumerate() {
             let at = (HEADER_SIZE + toc.len() + data.len()) as u64;
@@ -1888,5 +1996,31 @@ mod tests {
         let (unknown, found) = harvest(&archives, &crypto, &dict).unwrap();
         assert_eq!(unknown, 2);
         assert_eq!(found, [(s, "my_struct".to_string()), (m, "health_max".to_string())].into_iter().collect());
+    }
+
+    #[test]
+    fn catalog_lists_every_entry_and_names_hashes() {
+        let crypto = crypto();
+        // A standalone drawable header (pointers at +0x08/+0x10/+0x50 and the name at +0xA8, zero bounds).
+        let mut drawable = vec![0u8; 176];
+        for at in [8, 16, 80, 168] { drawable[at..at + 8].copy_from_slice(&(forge9::formats::resource::VIRTUAL_BASE + 176).to_le_bytes()); }
+        drawable.extend(b"prop_crate_01.#dr\0");
+        let a = sample(&crypto, b"beta", 6);
+        let b = named_archive(&crypto, &[b"<x n=\"Health_Max\"/>".to_vec(), b"x".to_vec(), b"y".to_vec(), drawable, b"z".to_vec()],
+            &[0xde396fe2, joaat("health_max"), joaat("no_such_name"), joaat("prop_crate_01"), 0]);
+        let archives = [("a.rpf".to_string(), Archive::open(&a, &crypto).unwrap()), ("b.rpf".to_string(), Archive::open(&b, &crypto).unwrap())];
+        let mut rows = catalog(&archives, &crypto).unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| (r.id(), r.ext, r.inflated)).collect();
+        let h = |n: &str| format!("{:#010x}", joaat(n));
+        assert_eq!(ids, [("a.rpf:0".into(), "xml", 25), ("a.rpf:1".into(), "rpf", rows[1].stored), ("a.rpf:1/0".into(), "bin", 5), ("a.rpf:1/1".into(), "bin", 4),
+            ("a.rpf:2".into(), "bin", 1000), ("b.rpf:0@0xde396fe2".into(), "bin", 19), (format!("b.rpf:1@{}", h("health_max")), "bin", 1),
+            (format!("b.rpf:2@{}", h("no_such_name")), "bin", 1), (format!("b.rpf:3@{}", h("prop_crate_01")), "bin", 194), ("b.rpf:4".into(), "bin", 1)]);
+        name_rows(&mut rows, &archives, &crypto, &rpf9::hashes::Dict::load(None).unwrap()).unwrap();
+        let status: Vec<_> = rows[5..].iter().map(|r| (r.status(), r.name.as_deref(), r.evidence)).collect();
+        let label = "embedded resource label";
+        assert_eq!(status, [("resolved", Some("root_document"), "dictionary"), ("candidate", None, label), ("unresolved", None, label),
+            ("resolved", Some("prop_crate_01.#dr"), label), ("unresolved", None, label)]);
+        assert!(rows[..5].iter().all(|r| r.hash.is_none() && r.status() == "unresolved"));
+        assert_eq!(rows[6].candidates, [("health_max".to_string(), "string in entry b.rpf:0".to_string())]);
     }
 }
