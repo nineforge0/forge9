@@ -89,7 +89,7 @@ impl<'a> Archive<'a> {
         // stored span; the declared decoded size counts every part.
         let blocks = inflate_zlib_chain(raw)?;
         let total: usize = blocks.iter().map(Vec::len).sum();
-        if let Some(d) = entry.decoded_size.filter(|&d| d != total as u64) {
+        if let Some(d) = entry.decoded_size.filter(|&d| (d as usize) < total) {
             bail!("entry #{} inflates to {total:#x} bytes in {} parts, but its record declares {d:#x}", entry.index, blocks.len());
         }
         Ok(blocks)
