@@ -9,7 +9,8 @@ use crate::rpf9::crypto::CryptoContext;
 use crate::rpf9::reader::Archive;
 
 /// Rebuilds `archive` (default: the manifest's target) with every patch and writes `output`.
-pub fn apply(m: &Manifest, archive: Option<&Path>, crypto: &CryptoContext, output: &Path) -> Result<()> {
+/// Returns each patched entry path and its new content.
+pub fn apply(m: &Manifest, archive: Option<&Path>, crypto: &CryptoContext, output: &Path) -> Result<BTreeMap<Vec<usize>, Vec<u8>>> {
     let target = archive.unwrap_or(&m.info.target_archive);
     let raw = std::fs::read(target).with_context(|| format!("reading {}", target.display()))?;
     let mut changes = BTreeMap::new();
@@ -20,7 +21,7 @@ pub fn apply(m: &Manifest, archive: Option<&Path>, crypto: &CryptoContext, outpu
     let out = rebuild_checked(&raw, crypto, &changes)?;
     std::fs::write(output, &out).with_context(|| format!("writing {}", output.display()))?;
     println!("applied {} patch(es) → {} ({} bytes)", changes.len(), output.display(), out.len());
-    Ok(())
+    Ok(changes)
 }
 
 /// Runs every patch in memory, without writing, and prints what each changes.

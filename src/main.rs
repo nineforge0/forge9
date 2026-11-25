@@ -109,6 +109,9 @@ enum Command {
         /// Output archive path
         #[arg(short, long, default_value = "repacked.rpf")]
         output: PathBuf,
+        /// Reopen the output and check every entry against the source; fails on any unexpected difference
+        #[arg(long)]
+        verify: bool,
     },
     /// Find entries (recursing into nested RPF9s) matching all given filters
     Search {
@@ -345,6 +348,9 @@ enum ModCommand {
         /// Archive to patch (default: the manifest's target_archive)
         #[arg(long)]
         archive: Option<PathBuf>,
+        /// Reopen the output and check every entry against the source; fails on any unexpected difference
+        #[arg(long)]
+        verify: bool,
     },
     /// Print a [[patch]] table that turns an extracted payload into an edited copy of it
     Make {
@@ -428,7 +434,7 @@ fn main() -> Result<()> {
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
         Command::Psin { archive, index, structs, limit } => cmd_psin(&archive, &crypto, index, structs, limit, &dict),
         Command::Tree { archive, depth } => cmd_tree(&archive, &crypto, depth),
-        Command::Repack { archive, patch, output } => cmd_repack(&archive, &crypto, &patch, &output),
+        Command::Repack { archive, patch, output, verify } => cmd_repack(&archive, &crypto, &patch, &output, verify),
         Command::Search { archive, magic, ext, min_size, grep, drawable } => {
             let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep: grep.map(String::into_bytes), drawable };
             let raw = std::fs::read(&archive)?;
@@ -471,9 +477,15 @@ fn main() -> Result<()> {
             };
             cmd_model(&parts, output, obj, lod, &textures, &dedup, &dict)
         }
-        Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
+        Command::Mod(ModCommand::Apply { manifest, output, archive, verify }) => {
             let m = modding::manifest::Manifest::load(&manifest)?;
-            modding::apply::apply(&m, archive.as_deref(), &crypto, &output)
+            let changes = modding::apply::apply(&m, archive.as_deref(), &crypto, &output)?;
+            if !verify { return Ok(()); }
+            let changes = changes.into_iter().map(|(k, v)| (k.iter().map(usize::to_string).collect::<Vec<_>>().join("/"), v)).collect();
+            let src = std::fs::read(archive.as_ref().unwrap_or(&m.info.target_archive))?;
+            let v = verify_written(&src, &std::fs::read(&output)?, &crypto, &changes)?;
+            anyhow::ensure!(v.problems.is_empty(), "verify failed: {} problem(s)", v.problems.len());
+            Ok(())
         }
         Command::Hash { .. } | Command::Texture { .. } | Command::BcpackAnalyze { .. } | Command::Mod(_) | Command::CheckPositions { .. } => unreachable!(),
     }
@@ -601,7 +613,7 @@ fn cmd_stats(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, top: usize, j
 
 /// A non-archive entry and its inflated payload's digest.
 #[derive(Debug, Clone)]
-struct Leaf { path: String, digest: u64, size: u64, ext: &'static str }
+struct Leaf { path: String, digest: u64, size: u64, ext: &'static str, offset: u64 }
 
 /// Every entry except nested archives, which are compared through their entries.
 fn leaves(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext) -> Result<Vec<Leaf>> {
@@ -612,7 +624,7 @@ fn leaves(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext)
         let bytes = content(a, e);
         let mut h = std::hash::DefaultHasher::new();
         bytes.hash(&mut h);
-        out.push(Leaf { path: path.to_string(), digest: h.finish(), size: bytes.len() as u64, ext: a.sniff(e) });
+        out.push(Leaf { path: path.to_string(), digest: h.finish(), size: bytes.len() as u64, ext: a.sniff(e), offset: e.offset });
     })?;
     Ok(out)
 }
@@ -682,6 +694,47 @@ fn cmd_diff(old: &PathBuf, new: &PathBuf, crypto: &rpf9::crypto::CryptoContext, 
     for (o, n) in &d.moved { println!("> {:<16} -> {} ({} bytes) .{}", o.path, n.path, n.size, n.ext); }
     println!("{} added, {} removed, {} changed, {} moved, {} identical", d.added.len(), d.removed.len(), d.changed.len(), d.moved.len(), d.same);
     Ok(d.differ())
+}
+
+/// What `--verify` found re-reading a written archive against its source.
+#[derive(Debug, Default)]
+struct Verified { checked: usize, intended: usize, confirmed: usize, moved: usize, padded: usize, problems: Vec<String> }
+
+/// Re-reads `out` against `src` and prints a summary: each `changes` path (`a/b`; anything under it may
+/// differ) reads back as its content, and every other entry as before, wherever its offset moved.
+/// A raw payload whose record stores no size may read back with extra zero padding: counted, not a problem.
+fn verify_written(src: &[u8], out: &[u8], crypto: &rpf9::crypto::CryptoContext, changes: &std::collections::BTreeMap<String, Vec<u8>>) -> Result<Verified> {
+    let old = leaves(&rpf9::reader::Archive::open(src, crypto)?, crypto)?;
+    let new = leaves(&rpf9::reader::Archive::open(out, crypto)?, crypto).context("reopening the written archive")?;
+    let covered = |p: &str| changes.keys().any(|c| p == c || p.strip_prefix(c.as_str()).is_some_and(|r| r.starts_with('/')));
+    let read = |raw: &[u8], p: &str| entry_blocks(raw, crypto, p).map(|b| b.concat());
+    let padded = |a: &[u8], b: &[u8]| a.starts_with(b) && a[b.len()..].iter().all(|&x| x == 0);
+    let first = |a: &[u8], b: &[u8]| a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+    let mut v = Verified { checked: old.len(), intended: changes.len(), ..Default::default() };
+    let was: std::collections::HashMap<&str, (u64, u64)> = old.iter().map(|l| (l.path.as_str(), (l.digest, l.offset))).collect();
+    v.moved = new.iter().filter(|n| was.get(n.path.as_str()).is_some_and(|&(d, o)| d == n.digest && o != n.offset)).count();
+    for (p, want) in changes {
+        match read(out, p) {
+            Ok(back) if padded(&back, want) => { v.confirmed += 1; v.padded += (back.len() > want.len()) as usize; }
+            Ok(back) => v.problems.push(format!("{p}: intended change reads back as {} bytes, not {}; first difference at {:#x}", back.len(), want.len(), first(&back, want))),
+            Err(e) => v.problems.push(format!("{p}: intended change missing: {e:#}")),
+        }
+    }
+    let d = diff(old, new);
+    for (o, n) in d.changed.iter().filter(|(o, _)| !covered(&o.path)) {
+        let (a, b) = (read(src, &o.path).unwrap_or_default(), read(out, &o.path).unwrap_or_default());
+        if padded(&a, &b) || padded(&b, &a) { v.padded += 1; continue; }
+        v.problems.push(format!("{}: unexpected change, {} -> {} bytes; first difference at {:#x}", o.path, o.size, n.size, first(&a, &b)));
+    }
+    for (o, n) in d.moved.iter().filter(|(o, n)| !(covered(&o.path) && covered(&n.path))) {
+        v.problems.push(format!("{}: unexpected change, content now at {} ({} bytes)", o.path, n.path, n.size));
+    }
+    for l in d.removed.iter().filter(|l| !covered(&l.path)) { v.problems.push(format!("{}: missing from output ({} bytes)", l.path, l.size)); }
+    for l in d.added.iter().filter(|l| !covered(&l.path)) { v.problems.push(format!("{}: unexpected new entry ({} bytes)", l.path, l.size)); }
+    for p in &v.problems { println!("  ✗ {p}"); }
+    println!("verify: {} entries checked, {}/{} intended changes confirmed, {} moved with identical bytes, {} zero padded, {} unexpected difference(s)",
+        v.checked, v.confirmed, v.intended, v.moved, v.padded, v.problems.len() - (v.intended - v.confirmed));
+    Ok(v)
 }
 
 /// Names for the PSIN schema hashes in `archives` that `dict` does not know: every identifier-like
@@ -775,7 +828,7 @@ fn cmd_replace(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usiz
     }
 }
 
-fn cmd_repack(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, patches: &[String], output: &PathBuf) -> Result<()> {
+fn cmd_repack(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, patches: &[String], output: &PathBuf, verify: bool) -> Result<()> {
     let raw = std::fs::read(path)?;
     let mut replacements = std::collections::HashMap::new();
     for patch in patches {
@@ -787,7 +840,12 @@ fn cmd_repack(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, patches: &[S
             .context(format!("reading patch file: {file_str}"))?;
         replacements.insert(idx, data);
     }
-    rpf9::writer::repack(&raw, crypto, &replacements, output)
+    rpf9::writer::repack(&raw, crypto, &replacements, output)?;
+    if !verify { return Ok(()); }
+    let changes = replacements.iter().map(|(i, d)| Ok((i.to_string(), rpf9::reader::decode(d)?))).collect::<Result<_>>()?;
+    let v = verify_written(&raw, &std::fs::read(output)?, crypto, &changes)?;
+    anyhow::ensure!(v.problems.is_empty(), "verify failed: {} problem(s)", v.problems.len());
+    Ok(())
 }
 
 fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, show_structs: bool, limit: usize, dict: &rpf9::hashes::Dict) -> Result<()> {
@@ -1777,9 +1835,39 @@ mod tests {
         assert!(d.added.is_empty() && d.removed.is_empty() && d.moved.is_empty());
         // An inserted entry moves the rest; a new nested payload is added, the old one removed.
         let shifted = &old[1..].iter().map(|l| Leaf { path: format!("{}x", l.path), ..l.clone() }).collect::<Vec<_>>();
-        let d = diff(old.clone(), shifted.iter().cloned().chain([Leaf { path: "9".into(), digest: 1, size: 1, ext: "bin" }]).collect());
+        let d = diff(old.clone(), shifted.iter().cloned().chain([Leaf { path: "9".into(), digest: 1, size: 1, ext: "bin", offset: 0 }]).collect());
         assert_eq!((d.moved.len(), d.added.len(), d.removed.len(), d.same), (3, 1, 1, 0));
         assert_eq!(d.removed[0].path, "0");
+    }
+
+    #[test]
+    fn verify_confirms_intended_changes_and_flags_the_rest() {
+        let c = crypto();
+        let src = sample(&c, b"beta", 6);
+        let repack = |raw: &[u8], i: usize, d: &[u8]| rpf9::writer::repack_bytes(raw, &c, &[(i, d.to_vec())].into()).unwrap();
+        // (entries checked, intended confirmed, moved with identical bytes, problems)
+        let check = |out: &[u8], changes: &[(&str, &[u8])]| {
+            let v = verify_written(&src, out, &c, &changes.iter().map(|(p, d)| (p.to_string(), d.to_vec())).collect()).unwrap();
+            ((v.checked, v.confirmed, v.moved, v.problems.len()), v.problems)
+        };
+        let same = rpf9::writer::repack_bytes(&src, &c, &Default::default()).unwrap();
+        assert_eq!(check(&same, &[]).0, (4, 0, 0, 0));
+        let xml: &[u8] = b"<?xml version='1.0'?><b/>";
+        assert_eq!(check(&repack(&src, 0, xml), &[("0", xml)]).0, (4, 1, 0, 0));
+        // A larger #0 moves #2; nested entries keep their offsets inside #1.
+        let big = [b'x'; 100];
+        let mut out = repack(&src, 0, &big);
+        assert_eq!(check(&out, &[("0", &big)]).0, (4, 1, 1, 0));
+        let gamma: &[u8] = b"a much longer gamma payload";
+        let inner = repack(&entry_blocks(&src, &c, "1").unwrap().concat(), 1, gamma);
+        assert_eq!(check(&repack(&src, 1, &inner), &[("1/1", gamma)]).0, (4, 1, 1, 0));
+        // Corruption in an untouched nested entry, and an intended change that is not there.
+        let at = out.windows(5).position(|w| w == b"alpha").unwrap();
+        out[at + 2] ^= 1;
+        let (counts, problems) = check(&out, &[("0", &big)]);
+        assert_eq!(counts, (4, 1, 1, 1));
+        assert_eq!(problems, ["1/0: unexpected change, 5 -> 5 bytes; first difference at 0x2"]);
+        assert_eq!(check(&same, &[("0", &big)]).0, (4, 0, 0, 1));
     }
 
     #[test]
