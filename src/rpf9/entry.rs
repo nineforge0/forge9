@@ -18,6 +18,10 @@ impl Entry {
         data.get(self.offset as usize..).is_some_and(zlib_head)
     }
 
+    /// The joaat name hash stored in the record. None of the three layouts read so far has a field
+    /// known to hold one, so this is `None` until such a field is identified.
+    pub fn name_hash(&self) -> Option<u32> { None }
+
     pub fn payload_magic(&self, data: &[u8]) -> Option<[u8; 4]> {
         let off = self.offset as usize;
         data.get(off..off + 4).map(|s| [s[0], s[1], s[2], s[3]])

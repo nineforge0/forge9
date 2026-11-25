@@ -164,6 +164,14 @@ forge9 hash player_one
 # Grow the hash dictionary: name unknown PSIN schema hashes from strings found in the archives
 forge9 harvest script.rpf common.rpf > names.txt
 forge9 --dict names.txt psin script.rpf 1 --structs
+
+# Entry catalog across archives (nested RPF9s included): one row per entry with its id
+# (`archive:path`, plus `@hash` when the record carries a name hash), kind, stored and inflated size,
+# and its name from the dictionary, else candidate names from archive strings whose joaat matches
+# (a 32-bit match can be a coincidence), else unresolved. No TOC layout read so far has a field
+# known to hold a name hash, so for now every entry is addressed by path and listed as unresolved.
+forge9 --dict names.txt catalog common.rpf script.rpf
+forge9 catalog common.rpf --json             # array of {id, archive, path, hash, kind, stored, inflated, status, name, candidates}
 ```
 
 ### Mod packs
@@ -212,7 +220,7 @@ entry does not match `base_sha256` (another game version, or already modded). v1
 
 | Format | Magic | Command | Status |
 |---|---|---|---|
-| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
+| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `catalog`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
 | zlib chains | `78 xx` | (automatic) | Inflated on read |
 | PSIN / PSO game data | `PSIN` | `psin`, `harvest` | Block table, struct schemas; schema hash names from archive strings |
 | AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
