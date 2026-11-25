@@ -4,8 +4,9 @@ What forge9's `repack` output has been checked against, and what is still
 unproven. Short version: an RPF9 reader that forge9 did not write parses
 forge9's repacked archives and reads every entry back correctly. Unchanged
 archives repack **byte-identically**. **No repacked archive has been shown to
-load in the game.** One published analysis says the game RSA-verifies RPF9
-headers, and forge9 does not re-sign them (see Limits).
+load in the game.** A static read of the game executable finds no archive
+integrity or signature check in the RPF9 load path (see Game loader), which
+removes the main structural objection but does not prove a live load.
 
 ## Reader used
 
@@ -65,20 +66,40 @@ data start to 4 KiB, and packed entries at 16-byte alignment. As a result:
 The writer now keeps the original physical order and each entry's original
 alignment (capped at 4 KiB), and it copies the original header bytes.
 
+## Game loader: no archive integrity check found
+
+A static analysis of the game executable (PE x86-64, ImageBase `0x140000000`;
+the game was not run) traced the code that reads the RPF9 magic and header. The
+loader validates only the 4-byte magic `9FPR` and then allocates and
+stream-reads the header and TOC. Evidence:
+
+- The only `bcrypt` imports are `BCryptGenRandom/Open/Close` (an RNG). There is
+  no `BCryptCreateHash`/`HashData`/`FinishHash`/`VerifySignature`, no NCrypt and
+  no CryptoAPI, and none of those names appear as strings (so they are not
+  resolved at runtime either).
+- SHA-256, SHA-512, MD5 and CRC32 constant tables exist in the binary, but every
+  xref to them lands in the TLS/X.509 certificate library and the online
+  (Xbox Live / libHttpClient) stack, far from the loader. The loader and its
+  constructor reach only allocator, stream and device routines.
+- The `RSA`, `Signature` and `Verify` strings belong to a PEM/X.509 library and
+  to web-token verification, not to archive loading. No archive-integrity string
+  exists.
+
+So on this executable the only gate on a repacked archive is the TOC block
+cipher: a correctly re-encrypted TOC (which forge9 produces) decrypts to valid
+records. This contradicts `rpf9-explorer`'s "RSA-2048 over header ranges" claim
+for this build. The result is a static negative on a vtable-heavy loader: not
+every virtual call in the mount path was resolved, so it is strong evidence, not
+a proof.
+
 ## Limits: what this does not show
 
-- **Game acceptance.** The game's loader is another RPF9 reader, but its rules
-  are stricter than anything tested here.
-- **Header signatures.** `rpf9-explorer`'s format notes
-  (`docs/rpf9-format-findings.md`) report RSA-2048 PKCS#1 v1.5 signatures,
-  using double SHA-256 over selected header ranges after the first transform,
-  on all 22 standalone and 4,351 child headers. They say that changing a
-  covered byte fails verification. forge9 writes new TOC ciphertext whenever
-  an offset changes and never re-signs. If those ranges cover the changed
-  bytes and the game enforces the check, a size-changing repack will be
-  rejected. We have not checked this claim. An identity repack is unaffected
-  because it is byte-identical.
-- **Index fields that forge9 does not model.** The same notes describe a
+- **Game acceptance.** The game's loader is another RPF9 reader. No integrity or
+  signature check was found in it (see Game loader), but a live load has still
+  not been shown, and the format-correctness points below can still make an
+  archive the running game rejects.
+- **Index fields that forge9 does not model.** `rpf9-explorer`'s format notes
+  (`docs/rpf9-format-findings.md`) describe a
   three-stage header transform, six record tables, per-chunk codec and length
   records, declared decoded lengths, and counter-mode encrypted members.
   forge9 rewrites only the 24-byte record's offset word. Declared lengths and
@@ -94,7 +115,9 @@ alignment (capped at 4 KiB), and it copies the original header bytes.
 
 The evidence supports this claim: *forge9's repacked archives are
 structurally valid RPF9 files that a separate RPF9 implementation accepts and
-reads back correctly, and unchanged archives round-trip byte-identically.* It
-does **not** support removing the disclaimer "repacked archives are not shown
-running in the game". The open header-signature question alone is a reason to
-keep it until a repacked archive is shown to load in the game.
+reads back correctly, and unchanged archives round-trip byte-identically.* The
+static read of the game loader removes the header-signature objection for this
+build: no archive hash or signature check was found. It does **not** support
+removing the disclaimer "repacked archives are not shown running in the game":
+format-correctness fields forge9 does not model, and a live load, are still
+untested.
