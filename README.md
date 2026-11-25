@@ -4,6 +4,25 @@ General-purpose toolkit for RPF9 archives. Read, decrypt, inspect, extract and a
 
 RPF9 is a container format used by a well-known retail game engine. This tool handles decryption, TOC parsing, entry listing, content extraction, and format detection: a foundation for research, interoperability work and asset tooling.
 
+## Scope and provenance
+
+forge9 is an independent, interoperability-oriented implementation of the RPF9
+container format. It is documentation and code about a file format, nothing more:
+
+- **No copyrighted content.** The repository contains no game code, assets,
+  archives, executables, cipher tables or keys, and none may be added. It
+  distributes nothing that belongs to any game or its publisher.
+- **You supply your own inputs.** The commands that open an archive need
+  `tables.bin` and `keys.bin`, which you extract from your own legally obtained
+  copy of the software. forge9 ships neither and cannot produce them.
+- **Original fixtures only.** Every test builds its bytes in memory (see
+  `CONTRIBUTING.md`); no sample is taken from any game.
+- **Not affiliated** with or endorsed by any game publisher. "RPF9" and format
+  field names are used descriptively to identify the format under study.
+
+The purpose is to understand and interoperate with a file format, not to
+reproduce, distribute or enable access to any protected work.
+
 ## Features
 
 - **Decrypt** archive table-of-contents using a 9-key T-table cipher with CBC mode

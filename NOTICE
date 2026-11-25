@@ -1,0 +1,22 @@
+forge9
+Copyright (c) 2026 nineforge0
+Licensed under the MIT License (see LICENSE).
+
+Scope and provenance
+--------------------
+forge9 is an independent, interoperability-oriented implementation of the RPF9
+container file format. It is code and documentation describing a file format.
+
+- This repository contains no game code, assets, archives, executables, cipher
+  tables, or keys, and none may be contributed. It distributes no content
+  belonging to any game or its publisher.
+- Commands that open an archive require cipher material (tables.bin, keys.bin)
+  that the user extracts from their own legally obtained copy of the software.
+  forge9 does not ship, generate, or help obtain that material.
+- All tests use fixtures generated in-repo. No sample derives from any game.
+- forge9 is not affiliated with, authorized by, or endorsed by any game
+  publisher. Trademarks and format field names are used descriptively only.
+
+The project's purpose is understanding and interoperating with a file format,
+not reproducing, distributing, or enabling unauthorized access to any protected
+work. Use forge9 only with files you are lawfully permitted to use.
