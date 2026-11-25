@@ -15,6 +15,7 @@ RPF9 is a container format used by a well-known retail game engine. This tool ha
 - **Decode payloads**: AWC audio streams, SGD5 shader databases, Bink 2 video headers, PSIN game data, paged resources
 - **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 to DDS or PNG (fitted endpoint tables; output is approximate, see [bcpack-rs#4](https://github.com/Ahmet-Dedeler/bcpack-rs/issues/4)), and BCPack BC3/BC4/BC5/BC7 to DDS (DX10) or PNG, including array slices (bcpack-rs `bc5-bc7` branch; checked against the stored mip pyramid on all 129 BC3/BC5/BC7 chunks we have)
 - **Models**: export a drawable's LOD geometry (positions, indices, normals, up to two UV sets and the RGBA8 vertex attribute when present, plus one material per shader with its diffuse, normal and emissive textures embedded when they resolve in the `.ttpf` stores, directly or through the `EDUP` dedup table of `textures.rpf`, read lazily so multi-GB and partially downloaded stores work; several entries, e.g. the parts of a character, merge into one scene) to glTF 2.0 (`.glb`, or `.gltf` + `.bin`) or OBJ. Standalone drawables and drawable dictionaries; checked on a real drawable dictionary (see [docs/drawable_format.md](docs/drawable_format.md))
+- **Geometry checks**: dump a drawable's stored vertex, index and meshlet buffers with a reference JSON (layout, quantization, decoded positions, meshlets, AABBs), and check a position buffer captured from a run against it: NaN/Inf, `w <= 0`, outlying `x/w`, `y/w`, AABB and reference mismatches, on-screen triangle coverage (see [docs/geometry_check.md](docs/geometry_check.md))
 - **Mod packs**: TOML manifests of hash-guarded patches (text, XML, binary) to the user's own files, verified and applied in one command
 - **Hexdump** individual entries for analysis
 - **JSON output** for integration with other tools
@@ -121,6 +122,11 @@ forge9 model packs.rpf 102/33 102/30 119/75 -o char.glb # several entries (chara
 forge9 model packs.rpf 102/33 --dedup textures.rpf      # EDUP table for deduplicated texture keys (default: textures.rpf next to the archive)
 forge9 search props.rpf --drawable              # every entry `model` can export, with mesh counts per LOD
 
+# Reference data for emulator testing: stored vertex/index/meshlet buffers + JSON per geometry, and a check of a
+# captured position buffer (stored, float3 or float4 clip) against it; see docs/geometry_check.md
+forge9 model props.rpf 12 --dump-buffers dump
+forge9 check-positions dump/g0.json capture.bin --layout clip --stride 16
+
 # Texture stores (.ttpf files sit next to the archives, not inside them)
 forge9 texture store.ttpf                       # list: size, format, mips, tile mode, hash
 forge9 texture store.ttpf --extract 12 -o a.dds # BC1/BC3/BC4/BC5/BC7 mip 0 as DDS
@@ -219,6 +225,7 @@ src/
     ps09.rs         PS09 driver pipeline cache
     bink.rs         Bink 2 video headers
     drawable.rs     drawable geometry, glTF/OBJ writers
+    geometry_check.rs  reference buffer dumps, captured position checks
     resource.rs     0DRP paged resources
     texture.rs      RDS5 texture stores (via bcpack-rs)
   modding/          mod packs
