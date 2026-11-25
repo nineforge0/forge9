@@ -324,6 +324,13 @@ used. A store with no header is skipped with a warning, and a texture whose
 chunks are missing or all zeros (a partially downloaded file) is reported
 as not decoded instead of failing the export.
 
+A `bumptex` whose texels are all identical and encode no unit vector is
+not embedded (`constant placeholder`). Many ped and prop shaders bind one
+of two 4x4 textures (`ttdb_peds_3_3.ttpf` #165 BC5, `ttdb_weapons.ttpf`
+#1368 BC1) whose every texel is zero; as a normal map that is (-1, -1, ~0)
+and renders black (it blacked out half of each legacy head, below). A flat
+`(0, 0, 1)` map is still embedded.
+
 With store textures forced in place of the keys, the output passes the
 Khronos glTF validator with 0 errors (warning: no TANGENT, since normal
 bits 20..31 are not decoded); the untextured export has 0 errors and 0
@@ -366,6 +373,47 @@ What a full textured character needs, and what the data has:
   (with EDUP); it is the only complete human found that is textured
   without guessing colours.
 
+### With the full data (60 stores, 358239 textures)
+
+Rechecked with every `.ttpf` of the complete install (57 stores, plus the
+3 in `bin/`) and the EDUP table:
+
+- Heads: of 1651 head drawables (the largest entry of each name), the face
+  `diffusetex` resolves for 20: `cs_ghost` (3), `cs_hitman`,
+  `cs_mangrove_hunter`, `cs_raul` (earring variant), five `sc_*` costumes,
+  four `u_*` uniques, three generic `head_mr1_cau`, one creature. The
+  leads' heads (`cs_lucia_head_fr1_lat`, `cs_lucia_old_head`,
+  `cs_jason_old_head`, the `player_story000_*` heads) and most female
+  heads bind no texture at all; most others bind 7 (`diffusetex`,
+  `bumptex`, `speculartex`, `speculartex2`, three null slots) and only the
+  diffuse key is missing. Those keys are in no store and nowhere in
+  `textures.rpf`, so the face colour is produced at run time.
+- The 64-bit store key is not FNV-1, FNV-1a, xxHash64, MurmurHash64A or
+  CRC-64 of the texture name (checked against the null texture,
+  `givemechecker` -> `5d7a3a87cc19967d`), so a missing key cannot be found
+  by name.
+- Hair drawables (`117`) are still 3-vertex stubs.
+- Clothing: the constant buffer (shader +0x08) starts with a pointer to
+  its own +0x08, then the values. A constant parameter's packed word is
+  consistent with `low 2 bits 3, (w >> 8) & 0x3fff` byte offset into the
+  values, `w >> 22` 32-bit words (in `player_..._basebottomssports` the 29
+  offsets ascend and each gap fits the count; 4-word values at 16-byte
+  boundaries). The values are scalars and flags (1, 0.05, 0.15, 24, ...);
+  no colour table is there or in the texture records that follow. The
+  `materialid` maps are BC4 or A8 (DXGI 65, tile mode 2, not decoded), so
+  clothing colour per material region is outside the drawable (likely in
+  the PSIN ped metadata beside the packs, e.g. `packs.rpf` `143`, `145`;
+  not decoded).
+- The leads do have fully textured low-detail stand-ins in `102`:
+  `cs_lucia_legacypedcs_fr1_000_fullbody` + `cs_lucia_legacyheadcs_fr1_001`
+  (874 + 296 vertices) and `cs_jason_legacypedcs_mr1_000_fullbody` +
+  `cs_jason_legacyheadcs_mr1_000` (772 + 302). Shader `0x7574b09b`;
+  each binds `diffusetex` (256x256 BC1 with the face, hair, outfit and
+  skin baked in), `speculartex`, `speculartex2`, the placeholder
+  `bumptex` and one null slot: 4 of 5 references resolve per part. Body
+  and head share the bind-pose frame of the detailed parts. The
+  `legacypedworld_*` crowd peds (`135`) use the same scheme.
+
 ## Header false positives in the particle effect list (`20/0`)
 
 The drawable header check used to accept 16 objects in `20/0`'s system
@@ -398,6 +446,22 @@ pack (where world drawables, drawable dictionaries and fragments would be),
 and dedicated vehicle and character packs. Those are where standalone
 drawables, fragments, skinned meshes, float3 positions and LODs 1..3 need
 to be validated.
+
+### Full install
+
+With the complete data (`forge9 search <archive> --drawable`, which now
+prints each hit's embedded names):
+
+| Archive | Drawable entries | Content |
+|---------|-----------------:|---------|
+| `pack/story000/story000.rpf` (762 entries) | 4160 | terrain/map tiles (`s09_w13_*` ... `s16_w17_*`), 6 effect models, 5 `anm_story0_*`; the largest nested archives (up to 2.8 GB) are AWC audio. No characters or vehicles |
+| `packs.rpf` | 24423 | peds: clothing, heads, hair stubs, cutscene and unique characters, animals (`97`), legacy crowd peds (`135`) |
+| `levels.rpf` | 80000+ | world and interiors; vehicles only as `*_batchlod` stand-ins (626 in `321`, 7 to 30 KB, LOD0 one mesh) and one interior display plane (`bk04_sky1b_vehicles`, `346/991`: 21 meshes, 59810 vertices, 124 of 129 references resolve; the paint shaders bind no `diffusetex`) |
+| `data.rpf` | 1163 | weapons (`w_*`), effect and core models |
+
+23 nested archives of `levels.rpf` (0.75 GB, e.g. `333`, `420`, `446`..`456`)
+and one of `data.rpf` do not open with any key of `keys.bin`; detailed
+vehicles, if anywhere, are in those or are fragments.
 
 Not validated (no local sample): standalone drawables, LODs 1..3, the
 float3 (99) position path, float2 texcoords, fragments, skinned meshes.

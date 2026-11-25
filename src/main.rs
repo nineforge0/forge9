@@ -445,7 +445,7 @@ fn main() -> Result<()> {
         Command::Repack { archive, patch, output, verify } => cmd_repack(&archive, &crypto, &patch, &output, verify),
         Command::Search { archive, magic, ext, min_size, grep, drawable } => {
             let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep: grep.map(String::into_bytes), drawable };
-            let raw = std::fs::read(&archive)?;
+            let raw = map_file(&archive)?;
             let hits = search(&raw, &archive.display().to_string(), &crypto, &filter)?;
             println!("{hits} matches");
             Ok(())
@@ -462,7 +462,7 @@ fn main() -> Result<()> {
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
         Command::Model { archive, index, output, obj, lod, textures, dedup, dump_buffers } => {
-            let raw = std::fs::read(&archive)?;
+            let raw = map_file(&archive)?;
             let parts = index.iter().map(|i| Ok((i.as_str(), entry_blocks(&raw, &crypto, i)?))).collect::<Result<Vec<_>>>()?;
             drop(raw);
             if let Some(out) = &dump_buffers {
@@ -500,7 +500,7 @@ fn main() -> Result<()> {
 }
 
 fn cmd_info(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let h = archive.header();
     println!("{} ({} bytes)", path.display(), raw.len());
@@ -513,7 +513,7 @@ fn cmd_info(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext) -> Result<()> 
 }
 
 fn cmd_list(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, limit: usize, json: bool, recursive: bool) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let mut rows = Vec::new();
     if recursive {
@@ -599,7 +599,7 @@ fn stats(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext) 
 }
 
 fn cmd_stats(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, top: usize, json: bool) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let s = stats(&rpf9::reader::Archive::open(&raw, crypto)?, crypto)?;
     let largest = &s.largest[..top.min(s.largest.len())];
     if json {
@@ -681,7 +681,7 @@ fn diff(old: Vec<Leaf>, new: Vec<Leaf>) -> Diff {
 /// Prints the differences; true if the archives differ.
 fn cmd_diff(old: &PathBuf, new: &PathBuf, crypto: &rpf9::crypto::CryptoContext, json: bool) -> Result<bool> {
     let leaves_of = |path: &PathBuf| -> Result<Vec<Leaf>> {
-        let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let raw = map_file(path).with_context(|| format!("reading {}", path.display()))?;
         leaves(&rpf9::reader::Archive::open(&raw, crypto)?, crypto)
     };
     let d = diff(leaves_of(old)?, leaves_of(new)?);
@@ -839,7 +839,7 @@ fn name_rows(rows: &mut [CatalogRow], archives: &[(String, rpf9::reader::Archive
 }
 
 fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool) -> Result<()> {
-    let raws = paths.iter().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
+    let raws = paths.iter().map(|p| map_file(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
     let archives = paths.iter().zip(&raws).map(|(p, r)| Ok((p.file_name().unwrap_or_default().to_string_lossy().into_owned(), rpf9::reader::Archive::open(r, crypto)?)))
         .collect::<Result<Vec<_>>>()?;
     let mut rows = catalog(&archives, crypto)?;
@@ -870,7 +870,7 @@ fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &r
 }
 
 fn cmd_harvest(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict) -> Result<()> {
-    let raws = paths.iter().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
+    let raws = paths.iter().map(|p| map_file(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
     let archives = raws.iter().map(|r| rpf9::reader::Archive::open(r, crypto)).collect::<Result<Vec<_>>>()?;
     let (unknown, found) = harvest(&archives, crypto, dict)?;
     for (h, name) in &found { println!("{h:#010x} {name}"); }
@@ -879,7 +879,7 @@ fn cmd_harvest(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &r
 }
 
 fn cmd_extract(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, output: &PathBuf, select: Option<String>) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     std::fs::create_dir_all(output)?;
     let indices: Option<Vec<usize>> = select.map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect());
@@ -898,7 +898,7 @@ fn cmd_extract(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, output: &Pa
 }
 
 fn cmd_hexdump(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, limit: usize) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let entry = archive.entries().get(index).ok_or_else(|| anyhow::anyhow!("index {index} out of range"))?;
     let bytes = archive.read_entry(entry)?;
@@ -946,7 +946,7 @@ fn cmd_repack(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, patches: &[S
 }
 
 fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, show_structs: bool, limit: usize, dict: &rpf9::hashes::Dict) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let entry = archive.entries().get(index)
         .ok_or_else(|| anyhow::anyhow!("entry index {index} out of range"))?;
@@ -982,7 +982,7 @@ fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, 
 }
 
 fn cmd_tree(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, max_depth: usize) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     tree(&raw, &path.display().to_string(), crypto, max_depth, 0)
 }
 
@@ -1028,8 +1028,9 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
             && f.ext.as_deref().is_none_or(|e| e.trim_start_matches('.') == ext)
             && f.magic.as_deref().is_none_or(|m| archive.head(entry, m.len()) == m);
         // Content is only inflated when needed: for grep or drawable, or to recurse.
-        let blocks = if (matches && (f.grep.is_some() || f.drawable)) || ext == "rpf" { archive.read_entry_blocks(entry).ok() } else { None };
-        let bytes = blocks.as_deref().map(<[Vec<u8>]>::concat);
+        // A nested archive is read in one piece (no block copy): the largest are several GB.
+        let blocks = if matches && ext != "rpf" && (f.grep.is_some() || f.drawable) { archive.read_entry_blocks(entry).ok() } else { None };
+        let bytes = if ext == "rpf" { archive.read_entry(entry).ok() } else { blocks.as_deref().map(<[Vec<u8>]>::concat) };
         let grep_ok = match (&f.grep, &bytes) {
             (None, _) => true,
             (Some(g), Some(b)) => !g.is_empty() && b.windows(g.len()).any(|w| w == g.as_slice()),
@@ -1041,9 +1042,14 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
                 .collect(),
             _ => Vec::new(),
         };
+        // The embedded drawable names, so a hit can be identified without exporting it.
+        let names = match bytes.as_deref().filter(|_| !lods.is_empty()).map(formats::drawable::labels).unwrap_or_default() {
+            l if l.len() <= 3 => l.iter().map(|n| format!("  {n}")).collect::<String>(),
+            l => format!("  {}, ... ({} drawables)", l[..3].join(", "), l.len()),
+        };
         if matches && grep_ok && (!f.drawable || !lods.is_empty()) {
             hits += 1;
-            println!("  {path:<24} {:#010x} {:>10} bytes .{ext}{}", entry.offset, entry.size, lods.concat());
+            println!("  {path:<24} {:#010x} {:>10} bytes .{ext}{}{names}", entry.offset, entry.size, lods.concat());
         }
         if ext == "rpf" {
             if let Some(b) = &bytes {
@@ -1057,6 +1063,14 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
     Ok(hits)
 }
 
+/// Read-only view of a file, memory-mapped so multi-GB archives are paged in on demand rather than read whole.
+/// Not for commands that may write the same path.
+fn map_file(path: &std::path::Path) -> Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: the mapping is read-only; forge9 never writes a file it has mapped.
+    unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mapping {}", path.display()))
+}
+
 /// Reads an entry by `index`, where `a/b/c` descends through nested RPF9s.
 fn load_entry(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<u8>> {
     Ok(load_entry_blocks(path, crypto, index)?.concat())
@@ -1064,7 +1078,7 @@ fn load_entry(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str)
 
 /// Like `load_entry`, keeping the final entry's inflated zlib blocks apart.
 fn load_entry_blocks(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<Vec<u8>>> {
-    entry_blocks(&std::fs::read(path)?, crypto, index)
+    entry_blocks(&map_file(path)?, crypto, index)
 }
 
 /// `load_entry_blocks` on archive bytes already in memory.
@@ -1231,7 +1245,7 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
 
 /// Key -> stored key from every EDUP entry at the top level of the archive at `path`.
 fn load_dedup(path: &std::path::Path, crypto: &rpf9::crypto::CryptoContext) -> Result<std::collections::HashMap<u64, u64>> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let mut map = std::collections::HashMap::new();
     for e in archive.entries().iter().filter(|e| archive.head(e, 4) == b"EDUP") {
@@ -1287,9 +1301,15 @@ fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Optio
                         drawable::EMISSIVE_PARAM => Some(&mut m.emissive),
                         _ => None,
                     };
-                    let used = match slot.map(|slot| s.load(&tex).and_then(|()| texture::material_png(&s.store, &tex)).map(|png| *slot = Some(png))) {
+                    let normal = t.param == drawable::BUMP_PARAM;
+                    let png = |s: &mut texture::LazyStore| s.load(&tex).and_then(|()| match normal {
+                        true => texture::material_normal_png(&s.store, &tex),
+                        false => texture::material_png(&s.store, &tex).map(Some),
+                    });
+                    let used = match slot.map(|slot| png(s).map(|png| png.map(|png| *slot = Some(png)))) {
                         None => String::new(),
-                        Some(Ok(())) => ", embedded".into(),
+                        Some(Ok(Some(()))) => ", embedded".into(),
+                        Some(Ok(None)) => ", constant placeholder (no unit normal), not embedded".into(),
                         Some(Err(e)) => format!(", not decoded: {e:#}"),
                     };
                     let via = stored.map_or(String::new(), |k| format!(" (dedup {k:016x})"));

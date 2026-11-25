@@ -19,3 +19,4 @@ toml = "1"
 sha2 = "0.10"
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "c55c5fad539644b8cf5a705051df214291763fc0", default-features = false, features = ["ttpf"] }
 bcdec_rs = "0.2.1"
+memmap2 = "0.9"
