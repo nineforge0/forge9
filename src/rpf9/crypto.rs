@@ -14,7 +14,21 @@ use std::path::Path;
 const STATE_SIZE: usize = 0x10F0;
 const KEY_BLOB_SIZE: usize = 0x10F4;
 const TABLES_SIZE: usize = 0x5000;
-const KEY_MAGIC: [u8; 4] = [0x8E, 0x9B, 0x3B, 0x4E];
+/// Family magic of the original 9-key set. The executable's full key table
+/// holds 22 schedules across multiple families (8E9B3B4E, 5DCE1827, 7E533141,
+/// 504F865E, 44AB246F, FB4BF43F, AA38AA57); all share the same T-tables and
+/// cipher algorithm, differing only in round keys and output S-boxes.
+const KEY_FAMILY_PRIMARY: [u8; 4] = [0x8E, 0x9B, 0x3B, 0x4E];
+
+const KEY_FAMILIES: [[u8; 4]; 7] = [
+    [0x8E, 0x9B, 0x3B, 0x4E], // 9 keys: indices 0-8
+    [0x5D, 0xCE, 0x18, 0x27], // 8 keys: indices 10-17
+    [0x7E, 0x53, 0x31, 0x41], // 1 key:  index 9
+    [0x50, 0x4F, 0x86, 0x5E], // 1 key:  index 18
+    [0x44, 0xAB, 0x24, 0x6F], // 1 key:  index 19
+    [0xFB, 0x4B, 0xF4, 0x3F], // 1 key:  index 20
+    [0xAA, 0x38, 0xAA, 0x57], // 1 key:  index 21
+];
 
 pub const TAG_IV: [u8; 16] = [
     0xC1, 0x7A, 0xAD, 0x4C, 0x53, 0xD6, 0x0E, 0xFA,
@@ -165,8 +179,11 @@ impl CryptoContext {
         if keys.is_empty() || keys.len() % KEY_BLOB_SIZE != 0 {
             bail!("keys.bin: expected a non-empty multiple of {KEY_BLOB_SIZE} bytes, got {}", keys.len());
         }
-        if let Some(index) = keys.chunks(KEY_BLOB_SIZE).position(|blob| blob[..4] != KEY_MAGIC) {
-            bail!("keys.bin: key {index} is not in the {KEY_MAGIC:02x?} family");
+        if let Some(index) = keys.chunks(KEY_BLOB_SIZE).position(|blob| {
+            !KEY_FAMILIES.iter().any(|fam| blob[..4] == *fam)
+        }) {
+            let magic: [u8; 4] = keys[index * KEY_BLOB_SIZE..][..4].try_into().unwrap();
+            bail!("keys.bin: key {index} has unrecognized family magic {magic:02x?}");
         }
         let inverse = InverseRound::build(&tables)?;
         Ok(Self { tables, keys, inverse })
@@ -175,6 +192,17 @@ impl CryptoContext {
     /// Number of key blobs in keys.bin.
     pub fn key_count(&self) -> usize {
         self.keys.len() / KEY_BLOB_SIZE
+    }
+
+    /// The 4-byte family magic of key `index`.
+    pub fn key_family(&self, index: usize) -> [u8; 4] {
+        let at = index * KEY_BLOB_SIZE;
+        self.keys[at..at + 4].try_into().unwrap()
+    }
+
+    /// Whether the keyring contains keys beyond the primary (8E9B3B4E) family.
+    pub fn has_secondary_families(&self) -> bool {
+        (0..self.key_count()).any(|i| self.key_family(i) != KEY_FAMILY_PRIMARY)
     }
 
     pub fn schedule(&self, index: usize) -> Result<KeySchedule<'_>> {
