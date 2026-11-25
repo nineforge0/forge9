@@ -240,6 +240,47 @@ enum Command {
         /// Texture stores to resolve material textures in (default: every .ttpf next to the archive)
         #[arg(long, num_args = 1..)]
         textures: Vec<PathBuf>,
+        /// Write each geometry's stored vertex, index and meshlet buffers and a reference JSON here
+        /// (no model is written unless -o or --obj is also given)
+        #[arg(long)]
+        dump_buffers: Option<PathBuf>,
+    },
+    /// Check a position buffer captured from a run against a `model --dump-buffers` reference JSON
+    CheckPositions {
+        /// Reference `g<i>.json`
+        reference: PathBuf,
+        /// Captured buffer (raw bytes)
+        capture: PathBuf,
+        /// stored (vertex buffer as stored), float3 (model space) or clip (f32x4 clip positions)
+        #[arg(long, default_value = "clip")]
+        layout: String,
+        /// Bytes between elements (default 12 for float3, 16 for clip)
+        #[arg(long)]
+        stride: Option<usize>,
+        /// Byte offset of the first element (or of the vertex buffer, for stored)
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Elements to check (default: one per vertex, or per meshlet slot)
+        #[arg(long)]
+        count: Option<usize>,
+        /// Elements are in meshlet order (meshlet 0's vertices, then meshlet 1's, ...), not vertex order
+        #[arg(long)]
+        meshlet_order: bool,
+        /// With --meshlet-order: each meshlet occupies this many elements (e.g. 128)
+        #[arg(long, requires = "meshlet_order")]
+        meshlet_slots: Option<usize>,
+        /// Model-space tolerance for the reference and AABB checks
+        #[arg(long, default_value_t = 1e-3)]
+        tolerance: f64,
+        /// Clip-space tolerance for the fit residual, in units of |w|
+        #[arg(long, default_value_t = 1e-3)]
+        clip_tolerance: f64,
+        /// |x/w| or |y/w| above this counts as outlying
+        #[arg(long, default_value_t = 16.0)]
+        ndc_limit: f64,
+        /// Worst offenders to list (0: counts only)
+        #[arg(long, default_value_t = 20)]
+        top: usize,
     },
     /// List textures in an RDS5 (.ttpf) store, or export one BC1/BC3/BC5/BC7 texture's mip 0
     Texture {
@@ -348,6 +389,18 @@ fn main() -> Result<()> {
         print!("{}", toml::to_string(&std::collections::BTreeMap::from([("patch", [p])]))?);
         return Ok(());
     }
+    if let Command::CheckPositions { reference, capture, layout, stride, offset, count, meshlet_order, meshlet_slots, tolerance, clip_tolerance, ndc_limit, top } = &cli.command {
+        use formats::geometry_check as gc;
+        let r: gc::Reference = serde_json::from_slice(&std::fs::read(reference).with_context(|| format!("reading {}", reference.display()))?)
+            .with_context(|| format!("parsing {}", reference.display()))?;
+        let data = std::fs::read(capture).with_context(|| format!("reading {}", capture.display()))?;
+        let opts = gc::Options { layout: gc::parse_layout(layout)?, stride: *stride, offset: *offset, count: *count, meshlet_order: *meshlet_order,
+            meshlet_slots: *meshlet_slots, tolerance: *tolerance, clip_tolerance: *clip_tolerance, ndc_limit: *ndc_limit, top: *top };
+        let stored = reference.parent().map(|d| d.join(&r.files.vertex)).and_then(|p| std::fs::read(p).ok());
+        let report = gc::check(&r, &data, stored.as_deref(), &opts)?;
+        print!("{}", report.text);
+        std::process::exit(if report.bad > 0 { 1 } else { 0 });
+    }
     if let Command::Texture { store, extract, decode, output, slice } = &cli.command {
         return cmd_texture(store, *extract, *decode, output.clone(), *slice);
     }
@@ -390,7 +443,12 @@ fn main() -> Result<()> {
         Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
-        Command::Model { archive, index, output, obj, lod, textures } => {
+        Command::Model { archive, index, output, obj, lod, textures, dump_buffers } => {
+            if let Some(dir) = &dump_buffers {
+                let d = formats::drawable::parse_blocks(&load_entry_blocks(&archive, &crypto, &index)?, lod)?;
+                cmd_dump_buffers(&d, dir)?;
+                if output.is_none() && obj.is_none() { return Ok(()); }
+            }
             let textures = if !textures.is_empty() { textures } else {
                 let dir = archive.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
                 let mut found: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|e| Some(e.ok()?.path()))
@@ -404,7 +462,7 @@ fn main() -> Result<()> {
             let m = modding::manifest::Manifest::load(&manifest)?;
             modding::apply::apply(&m, archive.as_deref(), &crypto, &output)
         }
-        Command::Hash { .. } | Command::Texture { .. } | Command::BcpackAnalyze { .. } | Command::Mod(_) => unreachable!(),
+        Command::Hash { .. } | Command::Texture { .. } | Command::BcpackAnalyze { .. } | Command::Mod(_) | Command::CheckPositions { .. } => unreachable!(),
     }
 }
 
@@ -995,6 +1053,17 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
     } else if drawable::looks_like(bytes) {
         println!("  standalone drawable (export with `model`)");
     }
+    Ok(())
+}
+
+fn cmd_dump_buffers(d: &formats::drawable::Drawable, dir: &std::path::Path) -> Result<()> {
+    for s in &d.skipped { eprintln!("  skipped {s}"); }
+    for (prefix, r) in formats::geometry_check::dump(d, dir)? {
+        let attrs: Vec<String> = r.attributes.iter().map(|a| format!("{}:{}", a.semantic, a.name)).collect();
+        println!("  {prefix} {}: {} vertices, {} triangles, {} meshlets, position format {}, vertex buffer {} bytes, index buffer {} bytes, semantics {}",
+            r.geometry, r.vertex_count, r.triangle_count, r.meshlets.len(), r.position.format, r.vertex_buffer.bytes, r.index_buffer.bytes, attrs.join(" "));
+    }
+    println!("{} LOD{}: {} geometries → {}", d.name, d.lod, d.meshes.len(), dir.display());
     Ok(())
 }
 
