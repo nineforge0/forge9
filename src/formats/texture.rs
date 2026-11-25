@@ -3,9 +3,10 @@
 //! Parsing, BCPack decoding (MDU rANS; BC1, and BC3/BC5/BC7 from the
 //! `bc5-bc7` branch), BC1 Gfx10 detiling and DDS/PNG output come from
 //! bcpack-rs by Ahmet Dedeler (https://github.com/Ahmet-Dedeler/bcpack-rs,
-//! MIT OR Apache-2.0). 16-byte-block pixels come from bcdec_rs.
+//! MIT OR Apache-2.0). BC3/BC4/BC5/BC7 pixels come from bcdec_rs.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use bcpack::{bc7, bcn, format::Mode};
 pub use bcpack::ttpf::{Store, Texture, CODEC_BC1, CODEC_STORED, CODEC_ZLIB};
 
@@ -56,6 +57,15 @@ fn read_into(file: &mut std::fs::File, data: &mut [u8], at: usize, len: usize) -
     Ok(file.read_exact(buf)?)
 }
 
+/// An `EDUP` table (an entry of `textures.rpf`): texture keys whose pixels are stored
+/// under another key. `EDUP`, u32 count, then count `{u64 key, u64 stored key}` sorted by key.
+pub fn edup(d: &[u8]) -> Option<HashMap<u64, u64>> {
+    if d.get(..4)? != b"EDUP" { return None; }
+    let n = super::u32_at(d, 4)? as usize;
+    let recs = d.get(8..8 + n.checked_mul(16)?)?;
+    Some(recs.chunks_exact(16).map(|r| (super::u64_at(r, 0).unwrap(), super::u64_at(r, 8).unwrap())).collect())
+}
+
 pub fn dxgi_name(dxgi: u32) -> &'static str {
     match dxgi {
         28 | 29 => "RGBA8",
@@ -85,16 +95,14 @@ pub fn codec_name(codec: u8) -> &'static str {
     }
 }
 
-/// Mip 0 (of array slice `slice`) of a BC1/BC3/BC5/BC7 texture as DDS bytes,
+/// Mip 0 (of array slice `slice`) of a BC1/BC3/BC4/BC5/BC7 texture as DDS bytes,
 /// or PNG when `png`; also returns the number of blocks bcpack-rs flags as
 /// depending on undetermined table values (0 = exact).
 pub fn export(store: &Store, tex: &Texture, png: bool, slice: u32) -> Result<(Vec<u8>, usize)> {
     let (blocks, unfitted) = mip0_blocks(store, tex, slice)?;
-    let bytes = match (png, is_16b(tex)) {
-        (true, _) => bcpack::ttpf::png_rgba(&to_rgba(&blocks, tex), tex.width, tex.height)?,
-        (false, true) => dds_dx10(&blocks, tex.width, tex.height, tex.dxgi),
-        (false, false) => bcpack::ttpf::dds_bc1(&blocks, tex.width, tex.height),
-    };
+    let bytes = if png { bcpack::ttpf::png_rgba(&to_rgba(&blocks, tex), tex.width, tex.height)? }
+        else if is_16b(tex) || is_bc4(tex) { dds_dx10(&blocks, tex.width, tex.height, tex.dxgi) }
+        else { bcpack::ttpf::dds_bc1(&blocks, tex.width, tex.height) };
     Ok((bytes, unfitted))
 }
 
@@ -113,10 +121,13 @@ fn rebuild_z(rgba: &mut [u8]) {
 }
 
 fn is_16b(tex: &Texture) -> bool { matches!(tex.dxgi, 76..=78 | 82..=84 | 97..=99) }
+fn is_bc4(tex: &Texture) -> bool { matches!(tex.dxgi, 79..=81) }
 
 fn to_rgba(blocks: &[u8], tex: &Texture) -> Vec<u8> {
     let (bw, bh, w, h) = (tex.width.div_ceil(4) as usize, tex.height.div_ceil(4) as usize, tex.width as usize, tex.height as usize);
-    if is_16b(tex) { bc16_to_rgba(blocks, tex.dxgi, bw, w, h) } else { bcpack::ttpf::bc1_to_rgba(blocks, bw, bh, w, h) }
+    if is_16b(tex) { bc16_to_rgba(blocks, tex.dxgi, bw, w, h) }
+    else if is_bc4(tex) { bc4_to_rgba(blocks, bw, w, h) }
+    else { bcpack::ttpf::bc1_to_rgba(blocks, bw, bh, w, h) }
 }
 
 /// Row-major mip 0 blocks of slice `slice` and bcpack-rs's unfitted block count.
@@ -125,6 +136,13 @@ fn mip0_blocks(store: &Store, tex: &Texture, slice: u32) -> Result<(Vec<u8>, usi
         return blocks_16b(store, tex, slice);
     }
     anyhow::ensure!(slice == 0, "texture {}: slices are only supported for BC3/BC5/BC7", tex.index);
+    if is_bc4(tex) {
+        anyhow::ensure!(tex.array_size == 1 && tex.tile_mode <= 3, "texture {}: BC4 array or tile mode {} not supported", tex.index, tex.tile_mode);
+        // Same 8-byte-element layout as BC1.
+        let (levels, _) = bcpack::ttpf::mip_chain_bc1(tex.tile_mode, tex.width, tex.height, tex.mips).context("unsupported mip layout")?;
+        let (tiled, unfitted) = gather(store, tex.vstart + levels[0].off, levels[0].len)?;
+        return Ok((bcpack::ttpf::detile_bc1(&tiled, &levels[0], tex.tile_mode).0, unfitted));
+    }
     let window = bcpack::bc1::Window::default_table();
     let quads = bcpack::bc1::QuadTable::default_table();
     let m = bcpack::texture_mip0(store, tex, &window, &quads).with_context(|| format!("texture {}", tex.index))?;
@@ -171,27 +189,7 @@ fn blocks_16b(store: &Store, tex: &Texture, slice: u32) -> Result<(Vec<u8>, usiz
     anyhow::ensure!(tex.tile_mode <= 3, "texture {}: tile mode {} not supported", tex.index, tex.tile_mode);
     anyhow::ensure!(slice < tex.array_size, "texture {}: slice {slice} out of range ({} slices)", tex.index, tex.array_size);
     let (off, len, rw, rh, ox, oy) = mip0_place_16b(tex.tile_mode, tex.width, tex.height, tex.mips, tex.array_size, slice);
-    let a = tex.vstart + off;
-    let mut tiled = Vec::with_capacity(len as usize);
-    let mut unfitted = 0;
-    for (ci, f, e) in store.locate(a, a + len)? {
-        let c = &store.chunks[ci];
-        let bytes = match (c.codec, Mode::from_codec(c.codec)) {
-            (CODEC_ZLIB | CODEC_STORED, _) => store.plain_chunk(ci)?,
-            (_, Some(Mode::Bc7)) => {
-                let r = bc7::decode(store.chunk_bytes(ci, true)?, c.vlen as usize, bc7::Tables::default_table()).map_err(|e| anyhow::anyhow!("chunk {ci}: {e:?}"))?;
-                unfitted += r.unfitted_blocks;
-                r.blocks
-            }
-            (_, Some(m @ (Mode::Bc3 | Mode::Bc5))) => {
-                let r = bcn::decode(store.chunk_bytes(ci, true)?, c.vlen as usize, bcn::Tables::default_for(m).unwrap()).map_err(|e| anyhow::anyhow!("chunk {ci}: {e:?}"))?;
-                unfitted += r.unfitted_blocks;
-                r.blocks
-            }
-            (x, _) => anyhow::bail!("chunk {ci}: codec {} in a 16-byte-block texture", codec_name(x)),
-        };
-        tiled.extend_from_slice(&bytes[f as usize..e as usize]);
-    }
+    let (tiled, unfitted) = gather(store, tex.vstart + off, len)?;
     let (rw, rh) = (rw as usize, rh as usize);
     let mut lin = vec![0u8; rw * rh * 16];
     for (i, d) in bcpack::ttpf::untile_order(tiled.len() / 16, rw, rh, pattern_16b(tex.tile_mode)).into_iter().enumerate() {
@@ -202,6 +200,48 @@ fn blocks_16b(store: &Store, tex: &Texture, slice: u32) -> Result<(Vec<u8>, usiz
     let (bw, bh) = (tex.width.div_ceil(4) as usize, tex.height.div_ceil(4) as usize);
     let blocks: Vec<u8> = (0..bh).flat_map(|y| lin[((y + oy as usize) * rw + ox as usize) * 16..][..bw * 16].iter().copied()).collect();
     Ok((blocks, unfitted))
+}
+
+/// Stored bytes of virtual range `a..a + len` with BCPack BC3/BC4/BC5/BC7 chunks
+/// decoded, and the number of blocks bcpack-rs flags as unfitted.
+fn gather(store: &Store, a: u64, len: u64) -> Result<(Vec<u8>, usize)> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut unfitted = 0;
+    for (ci, f, e) in store.locate(a, a + len)? {
+        let c = &store.chunks[ci];
+        let bytes = match (c.codec, Mode::from_codec(c.codec)) {
+            (CODEC_ZLIB | CODEC_STORED, _) => store.plain_chunk(ci)?,
+            (_, Some(Mode::Bc7)) => {
+                let r = bc7::decode(store.chunk_bytes(ci, true)?, c.vlen as usize, bc7::Tables::default_table()).map_err(|e| anyhow::anyhow!("chunk {ci}: {e:?}"))?;
+                unfitted += r.unfitted_blocks;
+                r.blocks
+            }
+            (_, Some(m @ (Mode::Bc3 | Mode::Bc4 | Mode::Bc5))) => {
+                let r = bcn::decode(store.chunk_bytes(ci, true)?, c.vlen as usize, bcn::Tables::default_for(m).unwrap()).map_err(|e| anyhow::anyhow!("chunk {ci}: {e:?}"))?;
+                unfitted += r.unfitted_blocks;
+                r.blocks
+            }
+            (x, _) => anyhow::bail!("chunk {ci}: codec {} not supported here", codec_name(x)),
+        };
+        out.extend_from_slice(&bytes[f as usize..e as usize]);
+    }
+    Ok((out, unfitted))
+}
+
+/// Row-major BC4 blocks -> grey RGBA8.
+fn bc4_to_rgba(blocks: &[u8], bw: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut rgba = vec![255u8; w * h * 4];
+    for (k, b) in blocks.chunks_exact(8).enumerate() {
+        let mut px = [0u8; 16];
+        bcdec_rs::bc4(b, &mut px, 4, false);
+        let (bx, by) = (k % bw * 4, k / bw * 4);
+        for y in 0..4.min(h - by) {
+            for x in 0..4.min(w - bx) {
+                rgba[((by + y) * w + bx + x) * 4..][..3].fill(px[y * 4 + x]);
+            }
+        }
+    }
+    rgba
 }
 
 /// Row-major BC3/BC5/BC7 blocks -> RGBA8 (BC5 as R, G, 0, 255).
@@ -340,6 +380,30 @@ mod tests {
         let err = LazyStore::open(&path).and_then(|mut s| s.load(&t)).unwrap_err();
         std::fs::remove_file(&path).unwrap();
         assert!(format!("{err}").contains("all zeros"));
+    }
+
+    #[test]
+    fn exports_bc4_texture_dx10_and_grey_png() {
+        // Stored 4 KiB tile, element 0 = one BC4 block: flat 200.
+        let mut chunk = vec![0u8; 4096];
+        chunk[..2].copy_from_slice(&[200, 200]);
+        let store = Store::from_bytes(store_over(&chunk, CODEC_STORED, 80)).unwrap();
+        let t = &store.textures().unwrap()[0];
+        let (dds, _) = export(&store, t, false, 0).unwrap();
+        assert_eq!((&dds[84..88], &dds[128..132]), (&b"DX10"[..], &80u32.to_le_bytes()[..]));
+        assert_eq!(&dds[148..], &chunk[..8]);
+        assert_eq!(bc4_to_rgba(&chunk[..8], 1, 3, 2), [200, 200, 200, 255].repeat(6));
+        assert_eq!(&material_png(&store, t).unwrap()[1..4], b"PNG");
+    }
+
+    #[test]
+    fn parses_edup_table() {
+        let mut d = b"EDUP".to_vec();
+        d.extend(2u32.to_le_bytes());
+        for v in [1u64, 10, 5, 50, 99] { d.extend(v.to_le_bytes()); } // 2 records, then trailing data
+        assert_eq!(edup(&d).unwrap(), HashMap::from([(1, 10), (5, 50)]));
+        assert!(edup(&d[..20]).is_none());
+        assert!(edup(b"PUDE\0\0\0\0").is_none());
     }
 
     #[test]

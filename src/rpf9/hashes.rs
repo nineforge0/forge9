@@ -28,7 +28,8 @@ const KNOWN: &[(u32, &str)] = &[
     (0x0a802776, "anim"), (0x2eb2ee6e, "navmeshes"),
     // Shader texture parameters
     (0xc8e8c282, "diffusetex"), (0x1e77bf4c, "bumptex"), (0xc6f46e79, "speculartex"),
-    (0x739e3d0d, "speculartex2"), (0x2c8d7182, "tintpalettetex"),
+    (0x739e3d0d, "speculartex2"), (0x2c8d7182, "tintpalettetex"), (0x8e0d63ee, "emissivetex"),
+    (0x8adb8480, "materialid"), (0x5c74c225, "givemechecker"),
 ];
 
 pub fn joaat(name: &str) -> u32 {
@@ -89,6 +90,7 @@ mod tests {
         assert_eq!(joaat(""), 0);
         assert_eq!(joaat("skel_root"), 0x6686685c);
         assert_eq!(joaat("CMapData"), 0xd3593fa6);
+        for &(h, n) in KNOWN.iter().skip_while(|(_, n)| *n != "diffusetex") { assert_eq!(joaat(n), h, "{n}"); }
         let parsed: Vec<_> = parse_lines("# c\n0xdeadbeef foo bar\nzz bad\n12 x\n").collect();
         assert_eq!(parsed, vec![(0xdeadbeef, "foo bar".to_string()), (0x12, "x".to_string())]);
         let d = Dict::load(None).unwrap();

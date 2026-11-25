@@ -273,9 +273,13 @@ shaders bind the same four textures:
 
 `model` looks each key up in the 64-bit hash of every ETPF descriptor of the
 `.ttpf` stores (`--textures`, default every `.ttpf` next to the archive),
-then embeds `diffusetex` as `baseColorTexture` and `bumptex` as
-`normalTexture` (PNG, mip 0; BC5 gets Z rebuilt as `sqrt(1 - x^2 - y^2)`).
+then embeds `diffusetex` as `baseColorTexture`, `bumptex` as
+`normalTexture` and `emissivetex` as `emissiveTexture` (factor 1) (PNG,
+mip 0; BC5 gets Z rebuilt as `sqrt(1 - x^2 - y^2)`, BC4 is grey).
 Materials set `metallicFactor` 0; other textures are reported, not mapped.
+Several entries (`model packs.rpf 102/33 102/30 119/75`) are merged into
+one scene: all parts of a character share one bind-pose frame, so they
+line up without transforms.
 
 The skulls' 12 references resolve in none of `platform.ttpf`,
 `ttdb_graphics.ttpf` or `ttdb_props.ttpf`: their store is not present.
@@ -291,8 +295,28 @@ references, 16293 distinct keys) against 19 stores (78169 textures):
 - `cvar_am_python_head_01a` (`core_restofworld.rpf` `1/28`) resolves its
   diffuse and bump maps in `ttdb_props.ttpf`; rendered, the scales, eye
   and mouth land on the mesh where they belong.
-- 19166 references use key `5d7a3a87cc19967d` (name hash 0x5c74c225) for
-  unbound slots; it is in no store, so it reads as a null texture.
+- 19166 references use key `5d7a3a87cc19967d` (name hash 0x5c74c225,
+  joaat of `givemechecker`) for unbound slots; it is in no store, so it
+  reads as a null texture.
+
+#### Deduplicated keys (`EDUP`)
+
+Many keys are in no store because their pixels are stored once under
+another key. `textures.rpf` (next to `packs.rpf`) has one top-level entry
+starting `EDUP`: u32 count, then count `{u64 key, u64 stored key}`
+records sorted by key (17431 records; data follows that is not decoded).
+No record's key is in a store; 13707 of the stored keys are, so the
+table is key -> canonical copy. `model` reads it from `--dedup`, default
+`textures.rpf` next to the archive, and falls back to the stored key
+when a key is not found directly. On the character packs it turns e.g.
+the player eyes from 2 of 4 to 4 of 4 resolved, and resolves the shared
+head `speculartex2` and many head `bumptex` maps (512x1024 BC5).
+
+#### Parameter names found by joaat
+
+`emissivetex` (0x8e0d63ee) and `materialid` (0x8adb8480) match their
+hashes among about 8000 candidate names for 10 unknown parameters, so a
+chance match is unlikely; they are in the built-in dictionary.
 
 Stores are opened lazily (`texture::LazyStore`): only the header, chunk
 table and ETPF index are read, then the chunks of each texture that is
@@ -304,6 +328,43 @@ With store textures forced in place of the keys, the output passes the
 Khronos glTF validator with 0 errors (warning: no TANGENT, since normal
 bits 20..31 are not decoded); the untextured export has 0 errors and 0
 warnings.
+
+## Character (ped) drawables
+
+Checked on `packs.rpf`: `144` holds the two player characters
+(`player_story000_00_*` body type `fr1`, `player_story000_01_*` `mr1`),
+`100`/`102`/`104` cutscene characters (`cs_*`), `151` unique characters
+(`u_*`), `148` costumes (`sc_*`), `119` hands, `126` generic heads, `91`,
+`96`, `139`, `141`, `146`, `153`, `155` clothing and accessories.
+Each name has three entries (LODs as separate drawables; the largest is
+the most detailed). All parts of one character share a bind-pose frame
+(A-pose, origin at the pelvis, Z up, facing -Y).
+
+What a full textured character needs, and what the data has:
+
+- Heads share one topology (2958 / 8983 / 599 vertices for the three
+  entries) and UV layout; the face texture is a 1024x1024 BC1/BC7 sRGB
+  `diffusetex`, with a 512x1024 BC5 `bumptex`. Player heads bind no
+  texture at all (shader `0x379efcef`, 0 textures), most generic and
+  cutscene heads bind a `diffusetex` key that is in none of the available
+  stores; a few unique and cutscene heads resolve fully.
+- Hair, brows, lashes and beards are 3-vertex stubs in all 661 human
+  cases (one triangle, one 16x16 texture): hair geometry is not in these
+  drawables.
+- There are no body skin drawables for the players; skin shows only
+  through hands (`119`) and the head. Most hand `diffusetex` keys are not
+  in the available stores.
+- Most clothing has no `diffusetex`: in the player pack 306 of the 328
+  shaders that bind `bumptex` also bind `materialid`, a BC4 mask with a
+  few flat grey levels, and only 42 bind a `diffusetex` (eyes, eye caps,
+  the stubs, a watch, a cap). Colour comes from per-region materials
+  outside the texture (the shader constants after the texture slots hold
+  scalars and a leading u32, not colours), not decoded here.
+- The `cs_ghost_*` cutscene character uses shader `0xb8916043` with
+  `diffusetex`, `bumptex`, `speculartex`, `speculartex2` and
+  `emissivetex` on head, suit, trousers and cap, all of which resolve
+  (with EDUP); it is the only complete human found that is textured
+  without guessing colours.
 
 ## Header false positives in the particle effect list (`20/0`)
 

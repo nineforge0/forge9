@@ -223,11 +223,12 @@ enum Command {
         /// Entry index; `5/3` descends into nested RPF9s
         index: String,
     },
-    /// Export a drawable entry's LOD geometry as glTF (.glb, or .gltf + .bin) or OBJ
+    /// Export the LOD geometry of one or more drawable entries as one glTF (.glb, or .gltf + .bin) or OBJ scene
     Model {
         archive: PathBuf,
-        /// Entry index; `5/3` descends into nested RPF9s
-        index: String,
+        /// Entry index; `5/3` descends into nested RPF9s. Several are merged into one scene
+        #[arg(required = true, num_args = 1..)]
+        index: Vec<String>,
         /// glTF output: binary unless the name ends in .gltf (default: model.glb)
         #[arg(short, long, conflicts_with = "obj")]
         output: Option<PathBuf>,
@@ -240,8 +241,11 @@ enum Command {
         /// Texture stores to resolve material textures in (default: every .ttpf next to the archive)
         #[arg(long, num_args = 1..)]
         textures: Vec<PathBuf>,
+        /// Archive whose EDUP tables map deduplicated texture keys (default: textures.rpf next to the archive)
+        #[arg(long)]
+        dedup: Option<PathBuf>,
     },
-    /// List textures in an RDS5 (.ttpf) store, or export one BC1/BC3/BC5/BC7 texture's mip 0
+    /// List textures in an RDS5 (.ttpf) store, or export one BC1/BC3/BC4/BC5/BC7 texture's mip 0
     Texture {
         store: PathBuf,
         /// Write this texture as DDS
@@ -390,15 +394,22 @@ fn main() -> Result<()> {
         Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
-        Command::Model { archive, index, output, obj, lod, textures } => {
+        Command::Model { archive, index, output, obj, lod, textures, dedup } => {
+            let dir = archive.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+            let dedup = match dedup {
+                Some(path) => load_dedup(&path, &crypto)?,
+                None => load_dedup(&dir.join("textures.rpf"), &crypto).unwrap_or_default(),
+            };
             let textures = if !textures.is_empty() { textures } else {
-                let dir = archive.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
                 let mut found: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|e| Some(e.ok()?.path()))
                     .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ttpf"))).collect();
                 found.sort();
                 found
             };
-            cmd_model(&load_entry_blocks(&archive, &crypto, &index)?, output, obj, lod, &textures, &dict)
+            let raw = std::fs::read(&archive)?;
+            let parts = index.iter().map(|i| Ok((i.as_str(), entry_blocks(&raw, &crypto, i)?))).collect::<Result<Vec<_>>>()?;
+            drop(raw);
+            cmd_model(&parts, output, obj, lod, &textures, &dedup, &dict)
         }
         Command::Mod(ModCommand::Apply { manifest, output, archive }) => {
             let m = modding::manifest::Manifest::load(&manifest)?;
@@ -838,15 +849,20 @@ fn load_entry(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str)
 
 /// Like `load_entry`, keeping the final entry's inflated zlib blocks apart.
 fn load_entry_blocks(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<Vec<u8>>> {
-    let mut blocks = vec![std::fs::read(path)?];
+    entry_blocks(&std::fs::read(path)?, crypto, index)
+}
+
+/// `load_entry_blocks` on archive bytes already in memory.
+fn entry_blocks(root: &[u8], crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<Vec<u8>>> {
+    let mut blocks: Option<Vec<Vec<u8>>> = None;
     for part in index.split(['/', '#']).filter(|p| !p.is_empty()) {
         let i: usize = part.parse().with_context(|| format!("bad entry index {part:?}"))?;
-        let bytes = if blocks.len() == 1 { blocks.pop().unwrap() } else { blocks.concat() };
-        let archive = rpf9::reader::Archive::open(&bytes, crypto)?;
+        let nested = blocks.take().map(|b| b.concat());
+        let archive = rpf9::reader::Archive::open(nested.as_deref().unwrap_or(root), crypto)?;
         let entry = archive.entries().get(i).ok_or_else(|| anyhow::anyhow!("entry index {i} out of range"))?;
-        blocks = archive.read_entry_blocks(entry)?;
+        blocks = Some(archive.read_entry_blocks(entry)?);
     }
-    Ok(blocks)
+    Ok(blocks.unwrap_or_else(|| vec![root.to_vec()]))
 }
 
 fn cmd_awc(bytes: &[u8]) -> Result<()> {
@@ -998,9 +1014,23 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize, stores: &[PathBuf], dict: &rpf9::hashes::Dict) -> Result<()> {
+/// Key -> stored key from every EDUP entry at the top level of the archive at `path`.
+fn load_dedup(path: &std::path::Path, crypto: &rpf9::crypto::CryptoContext) -> Result<std::collections::HashMap<u64, u64>> {
+    let raw = std::fs::read(path)?;
+    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
+    let mut map = std::collections::HashMap::new();
+    for e in archive.entries().iter().filter(|e| archive.head(e, 4) == b"EDUP") {
+        map.extend(formats::texture::edup(&archive.read_entry(e)?).with_context(|| format!("entry {}: bad EDUP table", e.index))?);
+    }
+    Ok(map)
+}
+
+/// Exports the drawables of `parts` (entry index, blocks) as one scene.
+fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize, stores: &[PathBuf],
+    dedup: &std::collections::HashMap<u64, u64>, dict: &rpf9::hashes::Dict) -> Result<()> {
     use formats::{drawable, texture};
-    let mut d = drawable::parse_blocks(blocks, lod)?;
+    let mut ds = parts.iter().map(|(i, b)| drawable::parse_blocks(b, lod).with_context(|| format!("entry {i}"))).collect::<Result<Vec<_>>>()?;
+    let mut d = if ds.len() == 1 { ds.pop().unwrap() } else { drawable::merge(format!("{} entries", ds.len()), ds) };
     for s in &d.skipped { eprintln!("  skipped {s}"); }
     let mut opened = Vec::new();
     for path in stores {
@@ -1010,23 +1040,34 @@ fn cmd_model(blocks: &[Vec<u8>], output: Option<PathBuf>, obj: Option<PathBuf>, 
         }
     }
     let total: usize = opened.iter().map(|(_, s)| s.textures.len()).sum();
+    if !dedup.is_empty() { println!("  {} deduplicated texture keys", dedup.len()); }
     let mut resolved = 0;
     for m in &mut d.materials {
         println!("  material {} (shader {:#010x}): {} textures", m.name, m.shader, m.textures.len());
         for t in &m.textures {
-            let hit = opened.iter_mut().find_map(|(name, s)| s.textures.iter().position(|x| x.hash == t.key).map(|i| (&*name, s, i)));
+            // A deduplicated key's pixels are stored under the key EDUP maps it to.
+            let direct = opened.iter().any(|(_, s)| s.textures.iter().any(|x| x.hash == t.key));
+            let stored = if direct { None } else { dedup.get(&t.key).copied() };
+            let key = stored.unwrap_or(t.key);
+            let hit = opened.iter_mut().find_map(|(name, s)| s.textures.iter().position(|x| x.hash == key).map(|i| (&*name, s, i)));
             let what = match hit {
                 None => format!("not in {} stores ({total} textures)", opened.len()),
                 Some((name, s, i)) => {
                     resolved += 1;
                     let tex = s.textures[i].clone();
-                    let slot = match t.param { drawable::DIFFUSE_PARAM => Some(&mut m.base_color), drawable::BUMP_PARAM => Some(&mut m.normal), _ => None };
+                    let slot = match t.param {
+                        drawable::DIFFUSE_PARAM => Some(&mut m.base_color),
+                        drawable::BUMP_PARAM => Some(&mut m.normal),
+                        drawable::EMISSIVE_PARAM => Some(&mut m.emissive),
+                        _ => None,
+                    };
                     let used = match slot.map(|slot| s.load(&tex).and_then(|()| texture::material_png(&s.store, &tex)).map(|png| *slot = Some(png))) {
                         None => String::new(),
                         Some(Ok(())) => ", embedded".into(),
                         Some(Err(e)) => format!(", not decoded: {e:#}"),
                     };
-                    format!("{name} #{} {}x{} {}{used}", tex.index, tex.width, tex.height, texture::dxgi_name(tex.dxgi))
+                    let via = stored.map_or(String::new(), |k| format!(" (dedup {k:016x})"));
+                    format!("{name} #{} {}x{} {}{via}{used}", tex.index, tex.width, tex.height, texture::dxgi_name(tex.dxgi))
                 }
             };
             println!("    {} name {:#010x} key {:016x}: {what}", dict.fmt(t.param), t.name_hash, t.key);
