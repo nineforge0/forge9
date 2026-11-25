@@ -279,6 +279,10 @@ enum Command {
         /// Archive whose EDUP tables map deduplicated texture keys (default: textures.rpf next to the archive)
         #[arg(long)]
         dedup: Option<PathBuf>,
+        /// Ped-meta PSIN entry of the archive (e.g. 5): materials without `diffusetex` get the diffuse key of the
+        /// variation record whose normal key equals their `bumptex` key (clothing binds `materialid`, not a diffuse)
+        #[arg(long)]
+        ped_meta: Option<String>,
         /// Write each geometry's stored vertex, index and meshlet buffers and a reference JSON here
         /// (no model is written unless -o or --obj is also given)
         #[arg(long)]
@@ -498,8 +502,12 @@ fn main() -> Result<()> {
         Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
-        Command::Model { archive, index, output, obj, lod, textures, dedup, dump_buffers, materials_json } => {
+        Command::Model { archive, index, output, obj, lod, textures, dedup, ped_meta, dump_buffers, materials_json } => {
             let raw = map_file(&archive)?;
+            let variations = match &ped_meta {
+                Some(i) => formats::pedmeta::variations(&entry_blocks(&raw, &crypto, i)?.concat())?,
+                None => Vec::new(),
+            };
             let parts = index.iter().map(|i| Ok((i.as_str(), entry_blocks(&raw, &crypto, i)?))).collect::<Result<Vec<_>>>()?;
             drop(raw);
             if let Some(out) = &dump_buffers {
@@ -520,7 +528,7 @@ fn main() -> Result<()> {
                 found.sort();
                 found
             };
-            cmd_model(&parts, output, obj, lod, &textures, &dedup, &dict, materials_json)
+            cmd_model(&parts, output, obj, lod, &textures, &dedup, &variations, &dict, materials_json)
         }
         Command::Mod(ModCommand::Apply { manifest, output, archive, verify }) => {
             let m = modding::manifest::Manifest::load(&manifest)?;
@@ -1458,11 +1466,18 @@ fn texture_location(stores: &[(String, formats::texture::LazyStore)], dedup: &st
 
 /// Exports the drawables of `parts` (entry index, blocks) as one scene.
 fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize, stores: &[PathBuf],
-    dedup: &std::collections::HashMap<u64, u64>, dict: &rpf9::hashes::Dict, materials_json: bool) -> Result<()> {
+    dedup: &std::collections::HashMap<u64, u64>, variations: &[formats::pedmeta::Variation], dict: &rpf9::hashes::Dict, materials_json: bool) -> Result<()> {
     use formats::{drawable, texture};
     let mut ds = parts.iter().map(|(i, b)| drawable::parse_blocks(b, lod).with_context(|| format!("entry {i}"))).collect::<Result<Vec<_>>>()?;
     let mut d = if ds.len() == 1 { ds.pop().unwrap() } else { drawable::merge(format!("{} entries", ds.len()), ds) };
     for s in &d.skipped { eprintln!("  skipped {s}"); }
+    for m in &mut d.materials {
+        if m.textures.iter().any(|t| t.param == drawable::DIFFUSE_PARAM) { continue; }
+        let Some(bump) = m.textures.iter().find(|t| t.param == drawable::BUMP_PARAM).map(|t| t.key) else { continue };
+        if let Some(v) = variations.iter().find(|v| v.normal == bump && v.diffuse != 0) {
+            m.textures.push(drawable::TextureRef { param: drawable::DIFFUSE_PARAM, name_hash: 0, key: v.diffuse });
+        }
+    }
     let mut opened = Vec::new();
     for path in stores {
         match texture::LazyStore::open(path) {
