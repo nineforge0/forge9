@@ -414,6 +414,103 @@ Rechecked with every `.ttpf` of the complete install (57 stores, plus the
   and head share the bind-pose frame of the detailed parts. The
   `legacypedworld_*` crowd peds (`135`) use the same scheme.
 
+### Ped metadata (`forge9 ped-meta`)
+
+The PSIN entries beside the character packs in `packs.rpf` tie drawables
+to textures outside the drawable. Common layout (all checked on real
+files; parsed by `formats::pedmeta`, synthetic tests in that module):
+
+- PSIN data: `PSIN`, u32 big-endian size, then 16-byte block rows `{u32
+  struct hash, u32 size, 8 x 0xaa}` ended by 8 x 0x70. Block data
+  follows, every block starting on a 16-byte boundary (without the
+  alignment, records of the 2.6 MB `packs.rpf` `5` land 44 bytes off).
+- Hash maps are node arrays: 16 control bytes, then 16 entries; a control
+  byte with the top bit set (0x80) is an empty slot. In `143` the first
+  node's control bytes are `60 43 59 1b 05 80 x11`, and exactly its first
+  five entries hold data.
+
+**Part table** (`143` before the player pack `144`, `101` before `102`,
+and the other small PSINs between packs): block `0x101`, 64-byte entries,
+one per drawable name of the pack (`143`: 130 parts, `144`: 130 distinct
+names):
+
+| Offset | Field | Evidence |
+|-------:|-------|----------|
+| +0x00 | u64 part id | equals +0x20 in all 130 |
+| +0x08 | properties map (24 bytes): `{u64, u32 ref, u32, u16 count, u16 capacity}` to `{u32 group hash, u32 0, u32 n, u32 n, u32 ref}` rows of u32 tag hashes | group `0x90810417` is joaat `baseskintone`, tag `0xc28f3ecd` is `skin_01`; another group lists `head_fr1_base_000_m_full` and `head_mr1_base_000_m_full` (joaat) |
+| +0x20 | u64 part id again | |
+| +0x28, +0x30 | u64, u64 | both zero in the 20 hair parts; +0x28 zero, +0x30 set in the 2 head parts; both set elsewhere |
+| +0x38 | u32 | 0 in all 130 |
+| +0x3C | u8 kind | `143`: 101 x 23 (garments), 20 x 30 (hair stubs), 2 x 62 (the two heads), 2 x 60 (eyes), 2 x 66, 3 x 1 (accessories, e.g. the watch) |
+
+The part id is a 64-bit hash of the drawable name; it is not FNV-1,
+FNV-1a, xxHash64, MurmurHash64A or CRC-64 of any of the 130 names (with
+or without `_full`, `.#dr`), so a part is tied to its drawable through its
+textures (below). A property ref `v` is block `v & 0xfff` (1-based),
+byte offset `v >> 20`, checked only on offsets below 4 KB.
+
+**Texture variation records** (`5`, 2.6 MB, blocks of struct
+`0x37e52277`, 184 bytes, 7227 non-empty records):
+
+| Offset | Field | Evidence |
+|-------:|-------|----------|
+| +0x00 | u32 variation name hash | `0x44e21c90` on most |
+| +0x08 | u64 part id | 254 records name player parts of `143` |
+| +0x10 | u64 diffuse or region-map key | in a store for 4459 records |
+| +0x18 | u64 normal key | in a store for 3710; equals the drawable's bound `bumptex` key, which is how a part id is matched to its drawable (256 player drawables linked) |
+| +0x20 | u64 | in no store |
+
+For player garments +0x10 is mostly `ttdb_peds_1_3` #1142, a black
+512x512 BC1 marked `DONTDEDUPE` (a null), or a flat green/orange/blue
+region map (material regions, colours not decoded); a few are real
+albedo maps (`player_story000_00_jacketbiker`: `ttdb_peds_1_3` #3250,
+worn black leather). Hair parts point at the 16x16 stub texture.
+
+`159` maps part ids to `{u64, u64 store key}` (a 16-slot map, block
+`0x103`), where the key is one of three shared 512x512 body region masks
+(torso, legs).
+
+**Face library** (`7`..`24`, `62`..`89`): 0x101 map nodes of 96-byte
+entries `{u64 store key, properties map, u64 key again, two empty maps,
+u32 ARGB average colour, bool}`. 15302 records, 1564 of the 1572
+1024x1024 sRGB ped textures (all the bald face skins); tags only on
+`baseskintone` (`skin_00`..`skin_05`). cs_hitman's face (`0ea5da3b...`)
+has average colour `ff5f6c96`.
+
+### Why the leads' faces stay untextured
+
+- Lucia's head (`cs_lucia_head_fr1_lat_000_y`, `102/478`, `482`, `483`)
+  and the player heads bind shader `0x379efcef` with 9 texture parameters
+  (`diffusetex`, `bumptex`, `speculartex`, `speculartex2`, five unnamed)
+  and every slot pointer null; no u64 in any of their entries is a store
+  key (scanned at every 4-byte offset against all 358239 keys and the
+  EDUP table).
+- The two player head parts (kind 62, ids `d8f651e6867c7a36`,
+  `1500dd133e3da6b2`) have no variation record in `5` and no entry in
+  `159`; both ids and their +0x30 values occur in no other top-level PSIN
+  of `packs.rpf`, and `d8f651e6867c7a36` occurs in no entry of
+  `data.rpf`, `common.rpf`, `script.rpf`, `story000_script.rpf`,
+  `story000.rpf` or the four other packs (`search --grep-hex`, which
+  inflates every entry; `1500dd...` checked in `story000.rpf` only).
+- 7-slot heads (`cs_artim` etc.) and some cutscene garments
+  (`cs_lucia_tshirtcrop`, all four textures, normal map included) bind keys
+  that are in no store and occur nowhere else in readable data; the face
+  library's tags never match a head part's tags.
+- Every file listed by the install layout is present. What is not
+  readable: 23 nested archives of `levels.rpf` (0.75 GB) and one of
+  `data.rpf` open with none of the 9 key schedules. The executable's
+  schedule table (`{u64 address, u32 0x10f4}` descriptors) lists 22
+  schedules: the 9 known ones and 13 more with other leading words
+  (`5dce1827` x8 and five singles); with the current cipher tables none
+  of the 13 opens those archives. The missing face, garment and 7-slot
+  head textures are most likely there or composed at run time; neither is
+  decoded.
+
+The leads' only complete textures are therefore the legacy stand-ins
+(`cs_lucia_legacypedcs` + `cs_lucia_legacyheadcs`,
+`cs_jason_legacypedcs` + `cs_jason_legacyheadcs`), whose 256x256 maps
+carry the face, hair and outfit.
+
 ## Header false positives in the particle effect list (`20/0`)
 
 The drawable header check used to accept 16 objects in `20/0`'s system

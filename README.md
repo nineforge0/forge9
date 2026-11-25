@@ -159,6 +159,14 @@ forge9 texture store.ttpf --decode 300 --slice 5 # one slice of an array texture
 forge9 bcpack-analyze store.ttpf --codec bc7     # BC3/BC5/BC7 entropy stage: fragments, lane stats
 forge9 bcpack-analyze store.ttpf 119 -o l.bin    # one chunk; lane symbol streams as u16 LE
 
+# Ped metadata PSIN: part table (one record per drawable of a character pack) and texture variation
+# records (part id, diffuse or region-map key, normal key); --normal finds a drawable's records by its bumptex key
+forge9 ped-meta packs.rpf 143
+forge9 ped-meta packs.rpf 5 --normal 7f3231727e17dcc5
+
+# Find raw bytes (e.g. a little-endian texture key) in every inflated entry, nested archives included
+forge9 search packs.rpf --grep-hex 245485440f247135
+
 # joaat hash of a name
 forge9 hash player_one
 

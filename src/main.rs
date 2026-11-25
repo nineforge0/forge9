@@ -132,11 +132,30 @@ enum Command {
         #[arg(long)]
         min_size: Option<u64>,
         /// Byte string to find in inflated content (slow)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "grep_hex")]
         grep: Option<String>,
+        /// Bytes to find in inflated content, as hex (e.g. a little-endian texture key: 2454854...)
+        #[arg(long)]
+        grep_hex: Option<String>,
         /// Only entries that `model` can export, with their mesh counts per LOD (slow)
         #[arg(long)]
         drawable: bool,
+    },
+    /// Ped metadata PSIN: the part table (one record per drawable of a character pack) and the
+    /// texture variation records (part id, diffuse or region-map key, normal key)
+    PedMeta {
+        archive: PathBuf,
+        /// Entry index, `a/b` for nested archives
+        index: String,
+        /// List texture variation records
+        #[arg(long)]
+        variations: bool,
+        /// Only variation records of this part id (hex)
+        #[arg(long)]
+        part: Option<String>,
+        /// Only variation records with this normal key (hex), e.g. a drawable's bound bumptex key
+        #[arg(long)]
+        normal: Option<String>,
     },
     /// Compute the joaat hash of a name
     Hash { name: String },
@@ -441,10 +460,15 @@ fn main() -> Result<()> {
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
         Command::Psin { archive, index, structs, limit } => cmd_psin(&archive, &crypto, index, structs, limit, &dict),
+        Command::PedMeta { archive, index, variations, part, normal } => {
+            let hex = |s: Option<String>| s.map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).with_context(|| format!("bad hex id {s:?}"))).transpose();
+            cmd_ped_meta(&load_entry(&archive, &crypto, &index)?, variations, hex(part)?, hex(normal)?)
+        }
         Command::Tree { archive, depth } => cmd_tree(&archive, &crypto, depth),
         Command::Repack { archive, patch, output, verify } => cmd_repack(&archive, &crypto, &patch, &output, verify),
-        Command::Search { archive, magic, ext, min_size, grep, drawable } => {
-            let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep: grep.map(String::into_bytes), drawable };
+        Command::Search { archive, magic, ext, min_size, grep, grep_hex, drawable } => {
+            let grep = match grep_hex { Some(h) => Some(parse_hex(&h)?), None => grep.map(String::into_bytes) };
+            let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep, drawable };
             let raw = map_file(&archive)?;
             let hits = search(&raw, &archive.display().to_string(), &crypto, &filter)?;
             println!("{hits} matches");
@@ -981,6 +1005,33 @@ fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, 
     Ok(())
 }
 
+fn cmd_ped_meta(psin: &[u8], list: bool, part: Option<u64>, normal: Option<u64>) -> Result<()> {
+    use formats::pedmeta;
+    let blocks = pedmeta::blocks(psin)?;
+    println!("{} data blocks: {}", blocks.len(), blocks.iter().map(|b| format!("{:#x}+{:#x}", b.hash, b.size)).collect::<Vec<_>>().join(", "));
+    match pedmeta::parts(psin) {
+        Ok(parts) => {
+            let mut kinds = std::collections::BTreeMap::new();
+            for p in &parts { *kinds.entry(p.kind).or_insert(0usize) += 1; }
+            println!("part table: {} parts, by kind {kinds:?}", parts.len());
+            if list || part.is_some() {
+                for p in parts.iter().filter(|p| part.is_none_or(|id| id == p.id)) {
+                    println!("  part {:016x} kind {:>3} {:016x} {:016x}", p.id, p.kind, p.extra[0], p.extra[1]);
+                }
+            }
+        }
+        Err(e) => println!("part table: none ({e})"),
+    }
+    let vars = pedmeta::variations(psin)?;
+    println!("{} texture variation records", vars.len());
+    if list || part.is_some() || normal.is_some() {
+        for v in vars.iter().filter(|v| part.is_none_or(|id| id == v.part) && normal.is_none_or(|k| k == v.normal)) {
+            println!("  variation {:08x} part {:016x} diffuse {:016x} normal {:016x} {:016x}", v.variation, v.part, v.diffuse, v.normal, v.extra);
+        }
+    }
+    Ok(())
+}
+
 fn cmd_tree(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, max_depth: usize) -> Result<()> {
     let raw = map_file(path)?;
     tree(&raw, &path.display().to_string(), crypto, max_depth, 0)
@@ -1061,6 +1112,14 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
         }
     }
     Ok(hits)
+}
+
+/// Bytes from a hex string; spaces are ignored.
+fn parse_hex(s: &str) -> Result<Vec<u8>> {
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    anyhow::ensure!(s.chars().all(|c| c.is_ascii_hexdigit()), "not a hex string: {s:?}");
+    anyhow::ensure!(!s.is_empty() && s.len() % 2 == 0, "hex string must have an even, nonzero number of digits");
+    Ok((0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect())
 }
 
 /// Read-only view of a file, memory-mapped so multi-GB archives are paged in on demand rather than read whole.
@@ -1925,6 +1984,15 @@ mod tests {
     fn sample(crypto: &CryptoContext, b: &[u8], level: u32) -> Vec<u8> {
         let nested = archive(crypto, &[b"alpha".to_vec(), b.to_vec()]);
         archive(crypto, &[b"<?xml version='1.0'?><a/>".to_vec(), nested, zlib(&[b'c'; 1000], level)])
+    }
+
+    #[test]
+    fn parses_hex_bytes() {
+        assert_eq!(parse_hex("24 54 85ff").unwrap(), vec![0x24, 0x54, 0x85, 0xff]);
+        assert!(parse_hex("245").is_err());
+        assert!(parse_hex("zz").is_err());
+        assert!(parse_hex("\u{e9}a").is_err());
+        assert!(parse_hex("").is_err());
     }
 
     #[test]
