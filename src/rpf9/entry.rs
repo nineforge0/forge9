@@ -15,15 +15,18 @@ pub struct Entry {
 
 impl Entry {
     pub fn is_zlib(&self, data: &[u8]) -> bool {
-        let at = self.offset as usize;
-        let Some(head) = data.get(at..at + 2) else { return false; };
-        head[0] & 0x0f == 8 && ((u16::from(head[0]) << 8) | u16::from(head[1])) % 31 == 0
+        data.get(self.offset as usize..).is_some_and(zlib_head)
     }
 
     pub fn payload_magic(&self, data: &[u8]) -> Option<[u8; 4]> {
         let off = self.offset as usize;
         data.get(off..off + 4).map(|s| [s[0], s[1], s[2], s[3]])
     }
+}
+
+/// True if `data` starts with a zlib stream header.
+pub fn zlib_head(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] & 0x0f == 8 && ((u16::from(data[0]) << 8) | u16::from(data[1])) % 31 == 0
 }
 
 const GRAPH_MAGIC: [u8; 16] = [

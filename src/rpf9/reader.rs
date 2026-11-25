@@ -110,6 +110,11 @@ impl<'a> Archive<'a> {
     }
 }
 
+/// A payload stored as `raw`, as `read_entry` returns it.
+pub fn decode(raw: &[u8]) -> Result<Vec<u8>> {
+    Ok(if entry::zlib_head(raw) { inflate_zlib_chain(raw)?.concat() } else { raw.to_vec() })
+}
+
 fn inflate_zlib_chain(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     use std::io::Read;
     let mut out = Vec::new();
