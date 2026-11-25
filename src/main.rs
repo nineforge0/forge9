@@ -60,6 +60,9 @@ enum Command {
         archives: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Merge unique name hash matches into a sorted `hexhash name` dictionary
+        #[arg(long, value_name = "PATH")]
+        write_dict: Option<PathBuf>,
     },
     /// Extract entries to a directory
     Extract {
@@ -183,17 +186,20 @@ enum Command {
         #[arg(long)]
         mesh: bool,
     },
-    /// Dump FSSM root-signature layouts of the shaders in an SGD5 entry
+    /// Inspect the native shaders in an SGD5 entry
     Fssm {
         archive: PathBuf,
         /// Entry index; `5/3` descends into nested RPF9s
         index: String,
-        /// Full layout and used resources of one shader record
+        /// Inspect just one shader record
         #[arg(long, conflicts_with = "roots")]
         shader: Option<usize>,
         /// One root-parameter line per program
         #[arg(long)]
         roots: bool,
+        /// Emit program identities and stage metadata as JSON
+        #[arg(long, conflicts_with = "roots")]
+        json: bool,
     },
     /// Classify the RDNA2 machine code of the shaders in an SGD5 entry, counting wave64-sensitive ops
     Isa {
@@ -277,6 +283,9 @@ enum Command {
         /// (no model is written unless -o or --obj is also given)
         #[arg(long)]
         dump_buffers: Option<PathBuf>,
+        /// Report material bindings and texture-index matches without exporting a model
+        #[arg(long, conflicts_with_all = ["output", "obj", "dump_buffers"])]
+        materials_json: bool,
     },
     /// Check a position buffer captured from a run against a `model --dump-buffers` reference JSON
     CheckPositions {
@@ -330,6 +339,9 @@ enum Command {
         /// Array slice to export (BC3/BC5/BC7)
         #[arg(long, default_value_t = 0)]
         slice: u32,
+        /// Report nominal texture payload bytes at four mip budgets as JSON
+        #[arg(long, conflicts_with_all = ["extract", "decode", "output", "slice"])]
+        budget: bool,
     },
     /// Entropy-stage analysis of BCPack BC3/BC5/BC6H/BC7 chunks: fragment headers, lane symbol stats
     BcpackAnalyze {
@@ -437,7 +449,8 @@ fn main() -> Result<()> {
         print!("{}", report.text);
         std::process::exit(if report.bad > 0 { 1 } else { 0 });
     }
-    if let Command::Texture { store, extract, decode, output, slice } = &cli.command {
+    if let Command::Texture { store, extract, decode, output, slice, budget } = &cli.command {
+        if *budget { return cmd_texture_budget(store); }
         return cmd_texture(store, *extract, *decode, output.clone(), *slice);
     }
     if let Command::BcpackAnalyze { store, chunk, codec, output, widths } = &cli.command {
@@ -455,7 +468,7 @@ fn main() -> Result<()> {
             Err(e) => { eprintln!("Error: {e:?}"); std::process::exit(2) }
         },
         Command::Harvest { archives } => cmd_harvest(&archives, &crypto, &dict),
-        Command::Catalog { archives, json } => cmd_catalog(&archives, &crypto, &dict, json),
+        Command::Catalog { archives, json, write_dict } => cmd_catalog(&archives, &crypto, &dict, json, write_dict.as_deref()),
         Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
@@ -477,7 +490,7 @@ fn main() -> Result<()> {
         Command::Awc { archive, index } => cmd_awc(&load_entry(&archive, &crypto, &index)?),
         Command::Shaders { archive, index, summary } => cmd_shaders(&load_entry(&archive, &crypto, &index)?, summary),
         Command::Pipelines { archive, index, mesh } => cmd_pipelines(&load_entry(&archive, &crypto, &index)?, mesh),
-        Command::Fssm { archive, index, shader, roots } => cmd_fssm(&load_entry(&archive, &crypto, &index)?, shader, roots),
+        Command::Fssm { archive, index, shader, roots, json } => cmd_fssm(&load_entry(&archive, &crypto, &index)?, shader, roots, json),
         Command::Isa { archive, index, summary, shader, heavy, opcodes, uniformity, rt_census, json, stage, dump } => {
             let bytes = load_entry(&archive, &crypto, &index)?;
             if rt_census { cmd_isa_rt_census(&bytes, json) } else if let Some(n) = uniformity { cmd_isa_uniformity(&bytes, n) } else if opcodes { cmd_isa_opcodes(&bytes, stage.as_deref()) } else { cmd_isa(&bytes, summary, shader, heavy, dump.as_deref()) }
@@ -485,7 +498,7 @@ fn main() -> Result<()> {
         Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
-        Command::Model { archive, index, output, obj, lod, textures, dedup, dump_buffers } => {
+        Command::Model { archive, index, output, obj, lod, textures, dedup, dump_buffers, materials_json } => {
             let raw = map_file(&archive)?;
             let parts = index.iter().map(|i| Ok((i.as_str(), entry_blocks(&raw, &crypto, i)?))).collect::<Result<Vec<_>>>()?;
             drop(raw);
@@ -507,7 +520,7 @@ fn main() -> Result<()> {
                 found.sort();
                 found
             };
-            cmd_model(&parts, output, obj, lod, &textures, &dedup, &dict)
+            cmd_model(&parts, output, obj, lod, &textures, &dedup, &dict, materials_json)
         }
         Command::Mod(ModCommand::Apply { manifest, output, archive, verify }) => {
             let m = modding::manifest::Manifest::load(&manifest)?;
@@ -550,7 +563,8 @@ fn cmd_list(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, limit: usize, 
         let total = rows.len().min(limit);
         for (i, (p, entry, ext, _)) in rows.iter().take(limit).enumerate() {
             let comma = if i + 1 >= total { "" } else { "," };
-            println!("  {{\"path\":\"{p}\",\"index\":{},\"offset\":{},\"size\":{},\"flags\":{},\"ext\":\"{ext}\"}}{comma}", entry.index, entry.offset, entry.size, entry.flags);
+            let decoded = entry.decoded_size.map_or("null".into(), |d| d.to_string());
+            println!("  {{\"path\":\"{p}\",\"index\":{},\"offset\":{},\"size\":{},\"decoded\":{decoded},\"flags\":{},\"ext\":\"{ext}\"}}{comma}", entry.index, entry.offset, entry.size, entry.flags);
         }
         println!("]");
     } else {
@@ -607,7 +621,7 @@ fn stats(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext) 
     walk(archive, "", crypto, &mut |path, a, e, nested| {
         if nested { s.nested += 1; return; }
         let (ext, zlib) = (a.sniff(e), e.is_zlib(a.data()));
-        let inflated = if zlib { content(a, e).len() as u64 } else { e.size };
+        let inflated = if zlib { content(a, e).len() as u64 } else { e.raw_len() };
         s.entries += 1;
         s.zlib += zlib as usize;
         s.stored += e.size;
@@ -796,15 +810,35 @@ fn harvest(archives: &[rpf9::reader::Archive], crypto: &rpf9::crypto::CryptoCont
     Ok((targets.len(), found))
 }
 
-/// Calls `f(path, word, joaat)` for every identifier-like string (`[A-Za-z0-9_]{3,64}`, as found
-/// and lowercased) in the entries that are not nested archives.
+/// Calls `f(path, word, joaat)` for every identifier-like string (`[A-Za-z0-9_]{3,64}`) and dotted
+/// identifier run (`[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+`, 3–64 bytes), as found and lowercased, in the
+/// entries that are not nested archives.
 fn scan_words(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext, f: &mut dyn FnMut(&str, &str, u32)) -> Result<()> {
+    let mut emit = |path: &str, bytes: &[u8]| {
+        if !(3..=64).contains(&bytes.len()) { return; }
+        let word = std::str::from_utf8(bytes).unwrap();
+        f(path, word, rpf9::hashes::joaat(word));
+        let lower = word.to_ascii_lowercase();
+        if lower != word { f(path, &lower, rpf9::hashes::joaat(&lower)); }
+    };
     walk(archive, "", crypto, &mut |path, a, e, nested| {
         if nested { return; }
         let bytes = content(a, e);
-        for word in bytes.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_')).filter(|w| (3..=64).contains(&w.len())) {
-            let word = std::str::from_utf8(word).unwrap();
-            for w in [word.to_string(), word.to_ascii_lowercase()] { f(path, &w, rpf9::hashes::joaat(&w)); }
+        for run in bytes.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')) {
+            let mut i = 0;
+            while i < run.len() {
+                while i < run.len() && run[i] == b'.' { i += 1; }
+                let start = i;
+                while i < run.len() && (run[i] != b'.' || (i + 1 < run.len() && run[i + 1] != b'.')) { i += 1; }
+                let dotted = &run[start..i];
+                if dotted.is_empty() { continue; }
+                if dotted.contains(&b'.') {
+                    emit(path, dotted);
+                    for part in dotted.split(|&b| b == b'.') { emit(path, part); }
+                } else {
+                    emit(path, dotted);
+                }
+            }
         }
     })
 }
@@ -833,7 +867,7 @@ fn catalog(archives: &[(String, rpf9::reader::Archive)], crypto: &rpf9::crypto::
     for (name, archive) in archives { walk(archive, "", crypto, &mut |path, a, e, nested| {
         let zlib = e.is_zlib(a.data());
         let bytes = if nested && !zlib { Vec::new() } else { content(a, e) };
-        let inflated = if zlib { bytes.len() as u64 } else { e.size };
+        let inflated = if zlib { bytes.len() as u64 } else { e.raw_len() };
         let labels = if nested { Vec::new() } else { formats::drawable::labels(&bytes) };
         rows.push(CatalogRow { archive: name.clone(), path: path.to_string(), hash: e.name_hash, ext: a.sniff(e), stored: e.size,
             inflated, name: (!labels.is_empty()).then(|| labels.join(", ")), evidence: "embedded resource label", candidates: Vec::new() });
@@ -862,12 +896,51 @@ fn name_rows(rows: &mut [CatalogRow], archives: &[(String, rpf9::reader::Archive
     Ok(())
 }
 
-fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool) -> Result<()> {
+/// Unique `(hash, name)` pairs from matching candidates or embedded resource labels.
+/// Returns `(entries, skipped_ambiguous)`.
+fn catalog_dict_entries(rows: &[CatalogRow]) -> (Vec<(u32, String)>, usize) {
+    let mut out = std::collections::BTreeMap::new();
+    let mut ambiguous = std::collections::HashSet::new();
+    for r in rows {
+        let Some(h) = r.hash else { continue };
+        let mut record = |name: &str| {
+            if rpf9::hashes::joaat(name) != h { return; }
+            let previous = out.entry(h).or_insert_with(|| name.to_string());
+            if previous != name { ambiguous.insert(h); }
+        };
+        match (&r.name, r.evidence, r.candidates.as_slice()) {
+            (Some(labels), "embedded resource label", _) => {
+                for label in labels.split(", ") {
+                    let stem = label.split_once(".#").map_or(label, |(s, _)| s);
+                    record(label);
+                    record(stem);
+                }
+            }
+            (None, _, candidates) => {
+                for (name, _) in candidates { record(name); }
+            }
+            _ => {}
+        }
+    }
+    out.retain(|hash, _| !ambiguous.contains(hash));
+    (out.into_iter().collect(), ambiguous.len())
+}
+
+fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool, write_dict: Option<&std::path::Path>) -> Result<()> {
     let raws = paths.iter().map(|p| map_file(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
     let archives = paths.iter().zip(&raws).map(|(p, r)| Ok((p.file_name().unwrap_or_default().to_string_lossy().into_owned(), rpf9::reader::Archive::open(r, crypto)?)))
         .collect::<Result<Vec<_>>>()?;
     let mut rows = catalog(&archives, crypto)?;
     name_rows(&mut rows, &archives, crypto, dict)?;
+    if let Some(out_path) = write_dict {
+        let (entries, skipped) = catalog_dict_entries(&rows);
+        let (added, total) = rpf9::hashes::write_dict(out_path, entries)?;
+        if skipped > 0 {
+            eprintln!("wrote {total} dict entries ({added} new, {skipped} ambiguous skipped) to {}", out_path.display());
+        } else {
+            eprintln!("wrote {total} dict entries ({added} new) to {}", out_path.display());
+        }
+    }
     if json {
         let records: Vec<_> = rows.iter().map(|r| serde_json::json!({
             "id": r.id(), "archive": r.archive, "path": r.path, "hash": r.hash.map(|h| format!("{h:#010x}")),
@@ -1222,15 +1295,67 @@ fn record_programs(sgd: &[u8], rec: &formats::sgd5::Shader) -> Result<Vec<format
         .collect()
 }
 
+fn fssm_inventory(bytes: &[u8], records: &[formats::sgd5::Shader], start: usize) -> serde_json::Value {
+    use serde_json::json;
+
+    let items: Vec<_> = records.iter().enumerate().map(|(i, record)| {
+        let mut item = json!({
+            "record": start + i, "name": record.name,
+            "sgd5_marker_offset": record.payload().start - 12,
+        });
+        let programs = (|| -> Result<Vec<_>> {
+            let dxbc = record.dxbc(bytes)?;
+            anyhow::ensure!(dxbc.starts_with(b"DXBC"), "not a DXBC container");
+            // RFC 9923 FNV-1a over the same inflated record XCL's CLI identifies.
+            let hash = dxbc.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            });
+            item["dxbc_fnv1a64"] = json!(format!("{hash:016x}"));
+            Ok(formats::xbch::sections(&dxbc)?.into_iter().map(|section| {
+                match formats::xbch::decompress(section) {
+                    Ok(native) => {
+                        let hash = modding::patch::sha256_hex(&native);
+                        match formats::fssm::parse(&native) {
+                            Ok(program) => {
+                                let stages: Vec<_> = program.stages.iter().map(|stage| json!({
+                                    "stage": stage.name(), "wave_size": if stage.wave32 { 32 } else { 64 },
+                                    "code_bytes": stage.code_size,
+                                })).collect();
+                                json!({ "fssm_sha256": hash, "stages": stages })
+                            }
+                            Err(err) => json!({ "fssm_sha256": hash, "error": err.to_string() }),
+                        }
+                    }
+                    Err(err) => json!({ "error": err.to_string() }),
+                }
+            }).collect())
+        })();
+        match programs {
+            Ok(programs) => item["programs"] = json!(programs),
+            Err(err) => item["error"] = json!(err.to_string()),
+        }
+        item
+    }).collect();
+    json!({ "format": "forge9-fssm-v1", "records": items })
+}
+
 fn root_line(stage: &formats::fssm::Stage) -> String {
     let params: Vec<String> = stage.root_params().iter().map(|p| p.to_string()).collect();
     let samplers = match stage.static_samplers() { 0 => String::new(), n => format!(" + {n} static samplers") };
     format!("{} root params [{}]{samplers}", params.len(), params.join(", "))
 }
 
-fn cmd_fssm(bytes: &[u8], shader: Option<usize>, roots: bool) -> Result<()> {
+fn cmd_fssm(bytes: &[u8], shader: Option<usize>, roots: bool, json: bool) -> Result<()> {
     use formats::fssm;
     let records = formats::sgd5::parse(bytes)?;
+    if json {
+        let selected = match shader {
+            Some(i) => std::slice::from_ref(records.get(i).with_context(|| format!("shader {i} out of range ({} records)", records.len()))?),
+            None => &records,
+        };
+        println!("{}", serde_json::to_string_pretty(&fssm_inventory(bytes, selected, shader.unwrap_or(0)))?);
+        return Ok(());
+    }
     if let Some(i) = shader {
         let rec = records.get(i).ok_or_else(|| anyhow::anyhow!("shader {i} out of range ({} records)", records.len()))?;
         println!("#{i} {} (tag {:#04x})", rec.name, rec.tag);
@@ -1324,9 +1449,16 @@ fn cmd_dump_buffers(d: &formats::drawable::Drawable, dir: &std::path::Path) -> R
     Ok(())
 }
 
+fn texture_location(stores: &[(String, formats::texture::LazyStore)], dedup: &std::collections::HashMap<u64, u64>, key: u64) -> Option<(usize, usize)> {
+    let find = |wanted| stores.iter().enumerate().find_map(|(store, (_, s))| {
+        s.textures.iter().position(|t| t.hash == wanted).map(|texture| (store, texture))
+    });
+    find(key).or_else(|| find(*dedup.get(&key)?))
+}
+
 /// Exports the drawables of `parts` (entry index, blocks) as one scene.
 fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize, stores: &[PathBuf],
-    dedup: &std::collections::HashMap<u64, u64>, dict: &rpf9::hashes::Dict) -> Result<()> {
+    dedup: &std::collections::HashMap<u64, u64>, dict: &rpf9::hashes::Dict, materials_json: bool) -> Result<()> {
     use formats::{drawable, texture};
     let mut ds = parts.iter().map(|(i, b)| drawable::parse_blocks(b, lod).with_context(|| format!("entry {i}"))).collect::<Result<Vec<_>>>()?;
     let mut d = if ds.len() == 1 { ds.pop().unwrap() } else { drawable::merge(format!("{} entries", ds.len()), ds) };
@@ -1339,20 +1471,47 @@ fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Optio
         }
     }
     let total: usize = opened.iter().map(|(_, s)| s.textures.len()).sum();
+    if materials_json {
+        use serde_json::json;
+        let materials: Vec<_> = d.materials.iter().map(|material| {
+            let bindings: Vec<_> = material.textures.iter().map(|binding| {
+                let source = texture_location(&opened, dedup, binding.key).map(|(store, index)| {
+                    let (name, store) = &opened[store];
+                    let tex = &store.textures[index];
+                    json!({
+                        "store": name, "index": tex.index, "stored_key": format!("{:016x}", tex.hash),
+                        "width": tex.width, "height": tex.height, "dxgi": tex.dxgi,
+                    })
+                });
+                json!({
+                    "parameter": format!("{:#010x}", binding.param),
+                    "parameter_name": dict.name(binding.param),
+                    "name_hash": format!("{:#010x}", binding.name_hash),
+                    "texture_key": format!("{:016x}", binding.key),
+                    "source": source,
+                })
+            }).collect();
+            json!({ "name": material.name, "shader": format!("{:#010x}", material.shader), "bindings": bindings })
+        }).collect();
+        let report = json!({
+            "format": "forge9-materials-v1", "name": d.name, "lod": d.lod,
+            "entries": parts.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            "mesh_count": d.meshes.len(), "skipped": d.skipped,
+            "indexed_store_count": opened.len(), "indexed_texture_count": total, "materials": materials,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     if !dedup.is_empty() { println!("  {} deduplicated texture keys", dedup.len()); }
     let mut resolved = 0;
     for m in &mut d.materials {
         println!("  material {} (shader {:#010x}): {} textures", m.name, m.shader, m.textures.len());
         for t in &m.textures {
-            // A deduplicated key's pixels are stored under the key EDUP maps it to.
-            let direct = opened.iter().any(|(_, s)| s.textures.iter().any(|x| x.hash == t.key));
-            let stored = if direct { None } else { dedup.get(&t.key).copied() };
-            let key = stored.unwrap_or(t.key);
-            let hit = opened.iter_mut().find_map(|(name, s)| s.textures.iter().position(|x| x.hash == key).map(|i| (&*name, s, i)));
-            let what = match hit {
+            let what = match texture_location(&opened, dedup, t.key) {
                 None => format!("not in {} stores ({total} textures)", opened.len()),
-                Some((name, s, i)) => {
+                Some((store, i)) => {
                     resolved += 1;
+                    let (name, s) = &mut opened[store];
                     let tex = s.textures[i].clone();
                     let slot = match t.param {
                         drawable::DIFFUSE_PARAM => Some(&mut m.base_color),
@@ -1371,7 +1530,7 @@ fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Optio
                         Some(Ok(None)) => ", constant placeholder (no unit normal), not embedded".into(),
                         Some(Err(e)) => format!(", not decoded: {e:#}"),
                     };
-                    let via = stored.map_or(String::new(), |k| format!(" (dedup {k:016x})"));
+                    let via = if tex.hash == t.key { String::new() } else { format!(" (dedup {:016x})", tex.hash) };
                     format!("{name} #{} {}x{} {}{via}{used}", tex.index, tex.width, tex.height, texture::dxgi_name(tex.dxgi))
                 }
             };
@@ -1407,6 +1566,42 @@ fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Optio
         for p in &m.positions { for k in 0..3 { min[k] = min[k].min(p[k]); max[k] = max[k].max(p[k]); } }
         println!("  {}: {} vertices, {} triangles, AABB {min:?}..{max:?}", m.name, m.positions.len(), m.indices.len() / 3);
     }
+    Ok(())
+}
+
+fn cmd_texture_budget(path: &std::path::Path) -> Result<()> {
+    use formats::texture;
+    use serde_json::json;
+
+    let store = texture::LazyStore::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut by_format = std::collections::BTreeMap::<u32, (usize, [u64; 4])>::new();
+    let mut included = 0;
+    let mut total = [0u64; 4];
+    for tex in &store.textures {
+        let Some(bytes) = texture::mip_payload_budget(tex) else { continue };
+        let (count, subtotal) = by_format.entry(tex.dxgi).or_default();
+        *count += 1;
+        included += 1;
+        for (i, bytes) in bytes.into_iter().enumerate() {
+            total[i] = total[i].checked_add(bytes).context("texture payload total exceeds u64")?;
+            subtotal[i] += bytes;
+        }
+    }
+    let formats: Vec<_> = by_format.iter().map(|(&dxgi, &(count, bytes))| json!({
+        "dxgi": dxgi, "format": texture::dxgi_name(dxgi),
+        "textures": count, "payload_bytes": bytes,
+    })).collect();
+    let report = json!({
+        "format": "forge9-texture-budget-v1",
+        "store": path.file_name().unwrap_or_default().to_string_lossy(),
+        "largest_mips_dropped": [0, 1, 2, 3],
+        "included_textures": included,
+        "skipped_textures": store.textures.len() - included,
+        "payload_bytes": total,
+        "saved_payload_bytes": total.map(|bytes| total[0] - bytes),
+        "by_format": formats,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -1945,22 +2140,25 @@ mod tests {
     /// An archive of `payloads` in the stored record layout `{offset/16, ceil(size/16), size}`.
     fn archive(crypto: &CryptoContext, payloads: &[Vec<u8>]) -> Vec<u8> { named_archive(crypto, payloads, &[]) }
 
-    /// `archive`, with a TOC column directory placing `names` as the name hash column after the records.
+    /// `archive`, with a TOC column directory before the records placing `names` as the name hash
+    /// column after them.
     fn named_archive(crypto: &CryptoContext, payloads: &[Vec<u8>], names: &[u32]) -> Vec<u8> {
         let records = payloads.len() * 24;
-        let mut toc = vec![0u8; records];
+        let mut toc = Vec::new();
         if !names.is_empty() {
-            for (id, count, off, stride) in [(0x33f7_0dfa_f2c5_0989u64, payloads.len(), 0, 24u64), (0xb707_6b62_45d3_5fb5, names.len(), records + 48, 4)] {
+            for (id, count, off, stride) in [(0x33f7_0dfa_f2c5_0989u64, payloads.len(), 0, 24u64), (0xb707_6b62_45d3_5fb5, names.len(), records, 4)] {
                 toc.extend([id.to_le_bytes(), ((count as u64) | (off as u64) << 32).to_le_bytes(), stride.to_le_bytes()].concat());
             }
-            toc.extend(names.iter().flat_map(|h| h.to_le_bytes()));
         }
+        let base = toc.len();
+        toc.resize(base + records, 0);
+        toc.extend(names.iter().flat_map(|h| h.to_le_bytes()));
         toc.resize((toc.len() + 16).next_multiple_of(16), 0);
         let mut data = Vec::new();
         for (i, p) in payloads.iter().enumerate() {
             let at = (HEADER_SIZE + toc.len() + data.len()) as u64;
-            for (k, v) in [at / 16, (p.len() as u64).div_ceil(16), p.len() as u64].iter().enumerate() {
-                toc[i * 24 + k * 8..i * 24 + k * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            for (k, v) in [at / 16, (p.len() as u64).div_ceil(16), rpf9::reader::decode(p).unwrap().len() as u64].iter().enumerate() {
+                toc[base + i * 24 + k * 8..base + i * 24 + k * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
             data.extend(p);
             data.resize(data.len().next_multiple_of(16), 0);
@@ -1980,6 +2178,81 @@ mod tests {
         z.finish().unwrap()
     }
 
+    #[test]
+    fn fssm_inventory_identifies_each_program_in_a_record() {
+        use std::io::Write;
+
+        let native = |hw: u64, wave32: bool| {
+            let mut blob = vec![0; 0x124];
+            blob[..4].copy_from_slice(b"FSSM");
+            blob[4..8].copy_from_slice(&1u32.to_le_bytes());
+            blob[0xc0..0xc8].copy_from_slice(&0x110u64.to_le_bytes());
+            blob[0xc8..0xd0].copy_from_slice(&4u64.to_le_bytes());
+            blob[0xd4] = if wave32 { 0x20 } else { 0 };
+            blob[0x100..0x108].copy_from_slice(&(0xc0_0002u64 << 16 | hw).to_le_bytes());
+            blob[0x120..0x124].copy_from_slice(&0xbf81_0000u32.to_le_bytes());
+            let compressed = zlib(&blob, 6);
+            let mut section = b"XBCH\x03\0\0\0".to_vec();
+            section.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+            section.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+            section.extend(compressed);
+            section
+        };
+        let sections = [native(6, false), b"invalid section".to_vec(), native(5, true), native(7, true)];
+        let mut dxbc = vec![0; 0x2c + 0x18];
+        dxbc[..4].copy_from_slice(b"DXBC");
+        dxbc[0x1c..0x20].copy_from_slice(&1u32.to_le_bytes());
+        dxbc[0x20..0x24].copy_from_slice(&0x24u32.to_le_bytes());
+        dxbc[0x24..0x28].copy_from_slice(b"DXIL");
+        dxbc.extend_from_slice(b"XDAT");
+        dxbc.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+        dxbc.extend_from_slice(&0x18u32.to_le_bytes());
+        let mut offset = 0x18 + 12 + 12 * sections.len() as u32;
+        for section in &sections {
+            for word in [formats::xbch::XDAT_XBCH, offset, section.len() as u32] {
+                dxbc.extend_from_slice(&word.to_le_bytes());
+            }
+            offset += section.len() as u32;
+        }
+        dxbc.extend(sections.into_iter().flatten());
+        let size = dxbc.len() as u32;
+        dxbc[0x18..0x1c].copy_from_slice(&size.to_le_bytes());
+        dxbc[0x28..0x2c].copy_from_slice(&(size - 0x2c).to_le_bytes());
+        let packed_record = |dxbc: &[u8]| {
+            let mut deflate = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            deflate.write_all(dxbc).unwrap();
+            let packed = deflate.finish().unwrap();
+            let size = packed.len() as u32;
+            let mut record = b"\x08fixture\0\x3c".to_vec();
+            for word in [size, u32::from_le_bytes(formats::sgd5::MARKER), size, dxbc.len() as u32] {
+                record.extend_from_slice(&word.to_le_bytes());
+            }
+            record.extend(packed);
+            record
+        };
+        let sgd = [b"SGD5".as_slice(), &packed_record(&dxbc), &packed_record(b"DXBC")].concat();
+
+        let inventory = fssm_inventory(&sgd, &formats::sgd5::parse(&sgd).unwrap(), 7);
+        let record = &inventory["records"][0];
+        assert_eq!(inventory["format"], "forge9-fssm-v1");
+        assert_eq!(record["record"], 7);
+        assert_eq!(record["sgd5_marker_offset"], 18);
+        assert_eq!(record["dxbc_fnv1a64"].as_str().unwrap().len(), 16);
+        assert_eq!(inventory["records"][1]["dxbc_fnv1a64"], "5d1b3d7271e4cb5e");
+        assert_eq!(inventory["records"][1]["error"], "DXBC header truncated");
+        assert_eq!(record["programs"][1]["error"], "not an XBCH blob");
+        for (i, stage, wave, hash) in [
+            (0, "CS", 64, "3111b8570c7820332f3c01a24ec4dc438f8abf5f7e290935906fc437f02eece8"),
+            (2, "PS", 32, "b9d32558d48e2bd971841555a87255cc15749dfdc9169155b0a7e1f45141b055"),
+            (3, "MS", 32, "e88902199eec42478662535cd2e308ed8e7bac758ef9788923b57b0103b1f68b"),
+        ] {
+            assert_eq!(record["programs"][i]["fssm_sha256"], hash);
+            assert_eq!(record["programs"][i]["stages"], serde_json::json!([
+                { "stage": stage, "wave_size": wave, "code_bytes": 4 },
+            ]));
+        }
+    }
+
     /// `[xml, rpf[a, b], zlib(c)]`
     fn sample(crypto: &CryptoContext, b: &[u8], level: u32) -> Vec<u8> {
         let nested = archive(crypto, &[b"alpha".to_vec(), b.to_vec()]);
@@ -1993,6 +2266,32 @@ mod tests {
         assert!(parse_hex("zz").is_err());
         assert!(parse_hex("\u{e9}a").is_err());
         assert!(parse_hex("").is_err());
+    }
+
+    #[test]
+    fn two_part_entry_reads_both_parts_from_its_own_span() {
+        // 0x10100 bytes: a 64 KiB zlib part and a 0x100 part, both in entry 0's stored span,
+        // then a neighbour that is not a continuation.
+        let crypto = crypto();
+        let content: Vec<u8> = (0..0x10100u32).map(|i| (i * 7 % 251) as u8).collect();
+        let chain = rpf9::writer::zlib_chain(&content).unwrap();
+        let raw = archive(&crypto, &[chain.clone(), b"next".to_vec()]);
+        let a = Archive::open(&raw, &crypto).unwrap();
+        let e = &a.entries()[0];
+        assert_eq!((e.size, e.decoded_size), (chain.len() as u64, Some(0x10100)));
+        let parts = a.read_entry_blocks(e).unwrap();
+        assert_eq!(parts.iter().map(Vec::len).collect::<Vec<_>>(), [0x10000, 0x100]);
+        assert_eq!(parts.concat(), content);
+        assert_eq!(a.read_entry(&a.entries()[1]).unwrap(), b"next");
+        // A record declaring only the first part's length is reported, not silently cut.
+        let mut bad = raw.clone();
+        let toc = &mut bad[HEADER_SIZE..HEADER_SIZE + 64];
+        crypto.schedule(0).unwrap().decrypt_cbc(toc, &TAG_IV);
+        toc[16..24].copy_from_slice(&0x10000u64.to_le_bytes());
+        crypto.schedule(0).unwrap().encrypt_cbc(toc, &TAG_IV);
+        let a = Archive::open(&bad, &crypto).unwrap();
+        let err = a.read_entry(&a.entries()[0]).unwrap_err().to_string();
+        assert_eq!(err, "entry #0 inflates to 0x10100 bytes in 2 parts, but its record declares 0x10000");
     }
 
     #[test]
@@ -2110,5 +2409,78 @@ mod tests {
             ("resolved", Some("prop_crate_01.#dr"), label), ("unresolved", None, label)]);
         assert!(rows[..5].iter().all(|r| r.hash.is_none() && r.status() == "unresolved"));
         assert_eq!(rows[6].candidates, [("health_max".to_string(), "string in entry b.rpf:0".to_string())]);
+    }
+
+    #[test]
+    fn catalog_resolves_dotted_candidate_names() {
+        let crypto = crypto();
+        let text = b"<Item>platform:/data/Content.XML</Item> ..setup2.meta.xml. foo..bar".to_vec();
+        let raw = named_archive(
+            &crypto,
+            &[text, b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec(), b"e".to_vec()],
+            &[0, joaat("content.xml"), joaat("content"), joaat("setup2.meta.xml"), joaat("foo..bar"), joaat("bar")],
+        );
+        let archives = [("pack.rpf".to_string(), Archive::open(&raw, &crypto).unwrap())];
+        let mut rows = catalog(&archives, &crypto).unwrap();
+        name_rows(&mut rows, &archives, &crypto, &rpf9::hashes::Dict::load(None).unwrap()).unwrap();
+        let ev = "string in entry pack.rpf:0".to_string();
+        assert_eq!(rows[1].candidates, [("content.xml".to_string(), ev.clone())]);
+        assert_eq!(rows[2].candidates, [("content".to_string(), ev.clone())]);
+        assert_eq!(rows[3].candidates, [("setup2.meta.xml".to_string(), ev.clone())]);
+        assert_eq!(rows[4].status(), "unresolved");
+        assert_eq!(rows[5].candidates, [("bar".to_string(), ev)]);
+    }
+
+    #[test]
+    fn catalog_write_dict_accumulates_sorted_deduped_entries() {
+        let crypto = crypto();
+        let mut drawable = vec![0u8; 176];
+        for at in [8, 16, 80, 168] { drawable[at..at + 8].copy_from_slice(&(forge9::formats::resource::VIRTUAL_BASE + 176).to_le_bytes()); }
+        drawable.extend(b"prop_crate_01.#dr\0");
+
+        let dict_path = std::env::temp_dir().join(format!("forge9-catalog-dict-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&dict_path);
+
+        // Run 1: archive a.rpf yields a single candidate ("health_max") and an embedded drawable label ("prop_crate_01").
+        let a = named_archive(&crypto, &[b"<x n=\"Health_Max\"/>".to_vec(), b"x".to_vec(), drawable, b"y".to_vec()],
+            &[0xde396fe2, joaat("health_max"), joaat("prop_crate_01"), joaat("no_such_name")]);
+        let archives_a = [("a.rpf".to_string(), Archive::open(&a, &crypto).unwrap())];
+        let mut rows_a = catalog(&archives_a, &crypto).unwrap();
+        name_rows(&mut rows_a, &archives_a, &crypto, &rpf9::hashes::Dict::load(None).unwrap()).unwrap();
+        // This JOAAT collision must be skipped even when each row supplies just one name.
+        let (label, candidate) = ("fixture_01142a", "fixture_027309");
+        let collision = joaat(label);
+        assert_eq!(collision, joaat(candidate));
+        rows_a.push(CatalogRow { hash: Some(collision), name: Some(label.into()), evidence: "embedded resource label", ..rows_a[2].clone() });
+        rows_a.push(CatalogRow { hash: Some(collision), name: None, candidates: vec![(candidate.into(), "ev".into())], ..rows_a[3].clone() });
+        let (entries_a, skipped) = catalog_dict_entries(&rows_a);
+        assert_eq!(skipped, 1);
+        assert_eq!(rpf9::hashes::write_dict(&dict_path, entries_a).unwrap(), (2, 2));
+
+        // Run 2: reload the written dict and catalog b.rpf (contains an already-recovered hash + a new candidate).
+        let dict = rpf9::hashes::Dict::load(Some(&dict_path)).unwrap();
+        let b = named_archive(&crypto, &[b"<x n=\"spawn_point\"/>".to_vec(), b"x".to_vec(), b"y".to_vec()],
+            &[0, joaat("health_max"), joaat("spawn_point")]);
+        let archives_b = [("b.rpf".to_string(), Archive::open(&b, &crypto).unwrap())];
+        let mut rows_b = catalog(&archives_b, &crypto).unwrap();
+        name_rows(&mut rows_b, &archives_b, &crypto, &dict).unwrap();
+        assert_eq!((rows_b[1].status(), rows_b[1].name.as_deref(), rows_b[1].evidence), ("resolved", Some("health_max"), "dictionary"));
+        let (entries_b, skipped_b) = catalog_dict_entries(&rows_b);
+        assert_eq!(skipped_b, 0);
+        assert_eq!(rpf9::hashes::write_dict(&dict_path, entries_b).unwrap(), (1, 3));
+
+        // Verify the accumulated file is deduplicated, sorted by hash, and reloads cleanly.
+        let text = std::fs::read_to_string(&dict_path).unwrap();
+        let mut expected = [
+            (joaat("health_max"), "health_max"),
+            (joaat("prop_crate_01"), "prop_crate_01"),
+            (joaat("spawn_point"), "spawn_point"),
+        ];
+        expected.sort_by_key(|(h, _)| *h);
+        let want: String = expected.iter().map(|(h, n)| format!("{h:#010x} {n}\n")).collect();
+        assert_eq!(text, want);
+        let reloaded = rpf9::hashes::Dict::load(Some(&dict_path)).unwrap();
+        for (h, n) in expected { assert_eq!(reloaded.name(h), Some(n)); }
+        let _ = std::fs::remove_file(&dict_path);
     }
 }
