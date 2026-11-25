@@ -92,6 +92,19 @@ for this build. The result is a static negative on a vtable-heavy loader: not
 every virtual call in the mount path was resolved, so it is strong evidence, not
 a proof.
 
+## Self-check: `--verify`
+
+`repack --verify` and `mod apply --verify` reopen the written archive with
+forge9's reader and compare it with the source by inflated payload, nested
+archives included. Each replacement or patch must read back as intended and
+every other entry must be byte-identical, wherever its offset moved. A raw
+entry whose record stores no size may read back with extra zero padding: that
+is counted, not flagged. Any other
+difference is listed with its path, old and new size and first differing
+offset, and the command exits nonzero. This catches a bad rebuild before a slow
+in-game boot. It checks forge9 against itself, so it is no proof that the game
+loads the archive.
+
 ## Limits: what this does not show
 
 - **Game acceptance.** The game's loader is another RPF9 reader. No integrity or

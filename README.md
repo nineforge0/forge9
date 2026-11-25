@@ -85,6 +85,10 @@ forge9 hexdump archive.rpf 0 --limit 256
 
 # Rebuild with replaced entries (any size)
 forge9 repack archive.rpf --patch 6=new.xml -o repacked.rpf
+
+# Same, then reopen the output and check it: every replacement reads back, every other entry is
+# byte-identical (offsets may move); exits nonzero on any unexpected difference
+forge9 repack archive.rpf --patch 6=new.xml -o repacked.rpf --verify
 ```
 
 ### Format decoders
@@ -195,6 +199,7 @@ value = "0.400000"
 forge9 mod init                          # write a template mod.toml
 forge9 mod verify mod.toml               # every guard and op checked, nothing written
 forge9 mod apply mod.toml -o modded.rpf  # repack the target with every patch
+forge9 mod apply mod.toml -o modded.rpf --verify  # then reopen it: patches present, nothing else changed
 forge9 diff common.rpf modded.rpf        # what changed
 forge9 mod make --path 9 original.xml edited.xml >> mod.toml   # ops from an edited extracted payload
 ```
