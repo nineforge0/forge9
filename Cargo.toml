@@ -14,6 +14,7 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
 sha2 = "0.10"
 bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "c55c5fad539644b8cf5a705051df214291763fc0", default-features = false, features = ["ttpf"] }

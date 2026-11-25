@@ -56,6 +56,86 @@ pub struct Mesh {
     pub indices: Vec<u32>,
     /// Index into `Drawable::materials`.
     pub material: Option<usize>,
+    /// The stored buffers and tables the mesh was decoded from.
+    pub buffers: Buffers,
+}
+
+/// A geometry's stored vertex and index buffers, byte for byte, with the tables that describe them.
+#[derive(Debug, Clone, Default)]
+pub struct Buffers {
+    /// Vertex buffer graphics data (`elements * element_stride` bytes): 16 u32 descriptors, the
+    /// quantization header at +0x60, then one stream per semantic (structure of arrays).
+    pub vertex: Vec<u8>,
+    pub elements: u32,
+    pub element_stride: u16,
+    /// Semantics with a nonzero layout size, in semantic order.
+    pub attributes: Vec<Attribute>,
+    /// Position format (66 quantized, 99 float3) and stream offset.
+    pub position_format: u32,
+    pub position_offset: usize,
+    pub quantization: Option<Quantization>,
+    /// Texcoord snorm16 scale at vertex data +0x7C.
+    pub texcoord_scale: Option<f32>,
+    /// Index buffer graphics data: header words, meshlet records, triangle words, vertex refs.
+    pub index: Vec<u8>,
+    pub meshlets: Vec<Meshlet>,
+    /// Bytes per vertex ref (2 or 4) and section offsets in `index`.
+    pub ref_size: usize,
+    pub triangles_offset: usize,
+    pub refs_offset: usize,
+    /// Meshlet-local vertex index to mesh vertex, concatenated over meshlets.
+    pub refs: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attribute {
+    pub semantic: usize,
+    pub offset: u32,
+    pub size: u8,
+    /// DXGI number declared by the layout (storage width).
+    pub format: u8,
+    /// The vertex descriptor at the same offset, if any.
+    pub descriptor: Option<u32>,
+}
+
+/// Format-66 position decode: `bias + scale * lane`, lanes reordered by `axis`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quantization {
+    pub bias: [f32; 3],
+    pub axis: u32,
+    pub scale: [f32; 3],
+}
+
+/// One 16-byte meshlet (cluster) record of the index buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Meshlet {
+    pub record: [u32; 4],
+    pub vertices: usize,
+    pub triangles: usize,
+    /// Start in `Buffers::refs` and in the triangle words.
+    pub first_ref: usize,
+    pub first_triangle: usize,
+}
+
+/// Quantization header of format-66 vertex data (+0x60 f32x3 bias, +0x6C u32 axis order, +0x70 f32x3 scale).
+pub fn quantization(vertex: &[u8]) -> Option<Quantization> {
+    Some(Quantization { bias: vec3(vertex, 96)?, axis: u32_at(vertex, 108)?, scale: vec3(vertex, 112)? })
+}
+
+/// `count` positions stored at `at` of vertex data in `format` 66 (quantization header read from the same
+/// data) or 99 (float3). Values are returned as stored, NaN and Inf included.
+pub fn decode_positions(vertex: &[u8], format: u32, at: usize, count: usize) -> Result<Vec<[f32; 3]>> {
+    let stride = match format { 99 => 12, 66 => 8, f => bail!("unsupported position format {f} (handled: 66 quantized, 99 float3)") };
+    ensure!(at + count * stride <= vertex.len(), "positions {at:#x}+{count}x{stride} overflow the {:#x}-byte vertex data", vertex.len());
+    if stride == 12 { return Ok((0..count).map(|i| vec3(vertex, at + i * 12).unwrap()).collect()); }
+    ensure!(at >= 128, "quantized positions overlap their origin/scale at +0x60");
+    let Quantization { bias, axis, scale } = quantization(vertex).unwrap();
+    Ok((0..count).map(|i| {
+        let q = u64_at(vertex, at + i * 8).unwrap();
+        let lanes = [(q >> 8) & 0xFF_FFFF, ((q >> 32) & 0xFFFF) << 8 | (q & 0xFF), q >> 48];
+        let [x, y, z] = [0, 1, 2].map(|k| (f64::from(bias[k]) + f64::from(scale[k]) * lanes[k] as f64) as f32);
+        match axis { 0 => [z, y, x], 1 => [y, z, x], _ => [x, y, z] }
+    }).collect())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -276,26 +356,29 @@ impl Res<'_> {
         ensure!(size as usize == stride && format == if stride == 12 { 6 } else { 16 },
             "position format {} disagrees with layout size {size} / format {format}", descriptor & 127);
         ensure!(at >= 96 && at + count * stride <= len, "positions {at:#x}+{count}x{stride} overflow the {len:#x}-byte vertex buffer");
-        let positions: Vec<[f32; 3]> = if stride == 12 {
-            (0..count).map(|i| vec3(vertex, at + i * 12).unwrap()).collect()
-        } else {
-            ensure!(at >= 128, "quantized positions overlap their origin/scale at +0x60");
-            let (bias, axis, scale) = (vec3(vertex, 96).unwrap(), u32_at(vertex, 108).unwrap(), vec3(vertex, 112).unwrap());
+        let quant = if stride == 8 { quantization(vertex) } else { None };
+        if let Some(Quantization { bias, axis, scale }) = quant {
             ensure!(axis <= 2 && finite(bias) && finite(scale) && scale.iter().all(|&s| s >= 0.0), "bad quantization origin/scale");
-            (0..count).map(|i| {
-                let q = u64_at(vertex, at + i * 8).unwrap();
-                let lanes = [(q >> 8) & 0xFF_FFFF, ((q >> 32) & 0xFFFF) << 8 | (q & 0xFF), q >> 48];
-                let [x, y, z] = [0, 1, 2].map(|k| (f64::from(bias[k]) + f64::from(scale[k]) * lanes[k] as f64) as f32);
-                match axis { 0 => [z, y, x], 1 => [y, z, x], _ => [x, y, z] }
-            }).collect()
-        };
+        }
+        let positions = decode_positions(vertex, descriptor & 127, at, count)?;
         ensure!(positions.iter().all(|&p| finite(p)), "non-finite vertex positions");
         let normals = self.normals(layout, count, vertex)?;
         let [uvs, uvs1] = [0, 1].map(|i| self.uvs(layout, UV_SEMANTICS[i], count, vertex));
         let colors = self.attribute(layout, COLOR_SEMANTIC, 4, 28, 6, count, vertex)?
             .map(|at| (0..count).map(|i| vertex[at + i * 4..][..4].try_into().unwrap()).collect());
-        let indices = self.indices(geometry, count)?;
-        Ok(Mesh { name, positions, normals, uvs: uvs?, uvs1: uvs1?, colors, indices, material: None })
+        let (indices, mut buffers) = self.indices(geometry, count)?;
+        let descriptors: Vec<u32> = (0..16).filter_map(|i| u32_at(vertex, i * 4)).collect();
+        for semantic in 0..52 {
+            let size = self.u8(layout + 0xD0 + semantic)?;
+            if size == 0 { continue; }
+            let offset = self.u32(layout + semantic * 4)?;
+            let descriptor = descriptors.iter().copied().find(|d| (d >> 7) & 0x1FF_FFFC == offset && d & 127 != 0);
+            buffers.attributes.push(Attribute { semantic, offset, size, format: self.u8(layout + 0x104 + semantic)?, descriptor });
+        }
+        let texcoord_scale = u32_at(vertex, 124).map(f32::from_bits).filter(|_| uvs.as_ref().is_ok_and(|u| u.is_some()) || uvs1.as_ref().is_ok_and(|u| u.is_some()));
+        buffers = Buffers { vertex: vertex.to_vec(), elements: self.u32(vb + 8)?, element_stride: self.u16(vb + 12)?,
+            position_format: descriptor & 127, position_offset: at, quantization: quant, texcoord_scale, ..buffers };
+        Ok(Mesh { name, positions, normals, uvs: uvs?, uvs1: uvs1?, colors, indices, material: None, buffers })
     }
 
     /// Shaders of the shader group the pointer at `at` refers to, with their texture references.
@@ -364,7 +447,8 @@ impl Res<'_> {
         Ok(uv.iter().flatten().all(|c| c.is_finite() && c.abs() <= 1e6).then_some(uv))
     }
 
-    fn indices(&self, geometry: usize, vertex_count: usize) -> Result<Vec<u32>> {
+    /// Triangle list, plus the stored index buffer and its meshlet table (vertex fields left default).
+    fn indices(&self, geometry: usize, vertex_count: usize) -> Result<(Vec<u32>, Buffers)> {
         let desc = self.ptr(geometry + 64, 16)?;
         let ib = self.ptr(desc, 64)?;
         ensure!(self.u16(ib + 12)? == 4, "index buffer stride is not 4");
@@ -392,9 +476,11 @@ impl Res<'_> {
         }).collect();
         ensure!(table.iter().all(|&v| (v as usize) < vertex_count), "vertex reference past {vertex_count} vertices");
         let mut out = Vec::with_capacity(triangles * 3);
+        let mut meshlets = Vec::with_capacity(clusters);
         let (mut ref_next, mut tri_next) = (0, 0);
         for cluster in 0..clusters {
             let (packed, offsets) = (word(12 + cluster * 16)?, word(16 + cluster * 16)?);
+            let record = [packed, offsets, word(20 + cluster * 16)?, word(24 + cluster * 16)?];
             let verts = (packed & 127) as usize + 1;
             let tris = ((packed >> 7) & 127) as usize + 1;
             let vstart = (offsets & 0xFFFF | ((packed >> 14) & 1) << 16) as usize;
@@ -410,10 +496,11 @@ impl Res<'_> {
                     out.push(table[vstart + local]);
                 }
             }
+            meshlets.push(Meshlet { record, vertices: verts, triangles: tris, first_ref: vstart, first_triangle: tstart });
             (ref_next, tri_next) = (ref_next + verts, tri_next + tris);
         }
         ensure!(ref_next == refs && tri_next == triangles, "clusters do not cover the index tables");
-        Ok(out)
+        Ok((out, Buffers { index: data.to_vec(), meshlets, ref_size, triangles_offset: tri_at, refs_offset: refs_at, refs: table, ..Default::default() }))
     }
 }
 
@@ -807,6 +894,32 @@ mod tests {
         let sys = blocks[..2].concat();
         assert!((0..sys.len()).step_by(16).all(|o| !header_at(&sys, o, false) && !header_at(&sys, o, true)));
         assert!(parse_blocks(&blocks, 0).is_err());
+    }
+
+    #[test]
+    fn keeps_stored_buffers() {
+        let blocks = synthetic(false);
+        let d = parse_blocks(&blocks, 0).unwrap();
+        let b = &d.meshes[0].buffers;
+        assert_eq!((b.vertex.len(), b.elements, b.element_stride, b.position_format, b.position_offset), (224, 14, 16, 66, 128));
+        assert_eq!(b.quantization, Some(Quantization { bias: [10.0, 20.0, 30.0], axis: 2, scale: [0.5; 3] }));
+        let sems: Vec<(usize, u32, u8)> = b.attributes.iter().map(|a| (a.semantic, a.offset, a.size)).collect();
+        assert_eq!(sems, [(0, 128, 8), (NORMAL_SEMANTIC, 192, 4), (COLOR_SEMANTIC, 208, 4), (UV_SEMANTICS[0], 160, 8)]);
+        assert!(b.attributes.iter().all(|a| a.descriptor.is_some()));
+        assert_eq!((b.index.len(), b.ref_size, b.triangles_offset, b.refs_offset, &b.refs[..]), (48, 2, 28, 36, &[3, 2, 1, 0][..]));
+        assert_eq!(b.meshlets, [Meshlet { record: [3 | 1 << 7, 0, 0, 0], vertices: 4, triangles: 2, first_ref: 0, first_triangle: 0 }]);
+        assert_eq!(decode_positions(&b.vertex, 66, 128, 4).unwrap(), d.meshes[0].positions);
+        assert_eq!(d.meshes[1].buffers.position_format, 99);
+        // The reference dump of the same drawable.
+        let dir = std::env::temp_dir().join(format!("forge9-dump-{}", std::process::id()));
+        let refs = super::super::geometry_check::dump(&d, &dir).unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!(std::fs::read(dir.join("g0.vertex.bin")).unwrap(), b.vertex);
+        assert_eq!(std::fs::read(dir.join("g0.meshlets.bin")).unwrap(), &b.index[12..28]);
+        let r: super::super::geometry_check::Reference = serde_json::from_slice(&std::fs::read(dir.join("g0.json")).unwrap()).unwrap();
+        assert_eq!((r.triangle_count, r.meshlets.len(), r.positions, r.indices), (2, 1, d.meshes[0].positions.clone(), vec![3, 2, 1, 3, 1, 0]));
+        assert_eq!((r.meshlets[0].aabb.min, r.meshlets[0].aabb.max), ([10.0, 20.0, 30.0], [11.0, 21.0, 32.0]));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
