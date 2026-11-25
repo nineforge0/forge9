@@ -5,6 +5,7 @@ pub mod bcpack_analyze;
 pub mod bink;
 pub mod drawable;
 pub mod fssm;
+pub mod geometry_check;
 pub mod ps09;
 pub mod rdna2;
 pub mod rdna2_disasm;
