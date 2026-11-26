@@ -182,20 +182,19 @@ impl PsinContainer {
 
         let mut structs = Vec::new();
         let mut enums = Vec::new();
-        let mut dom = None;
+        let mut psin_body = None;
 
         for section in &sections {
             let body = &data[section.offset + 8..section.offset + section.length];
             match &section.tag {
                 b"LSCH" => structs = parse_lsch(body)?,
                 b"LENM" => enums = parse_lenm(body)?,
-                b"PSIN" if section.offset == 0 => {
-                    dom = parse_psin_instances(body, &structs).ok().flatten();
-                }
+                b"PSIN" if section.offset == 0 => psin_body = Some(body),
                 _ => {}
             }
         }
 
+        let dom = psin_body.and_then(|body| parse_psin_instances(body, &structs).ok().flatten());
         Ok(PsinContainer { sections, structs, enums, dom })
     }
 }
