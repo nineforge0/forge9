@@ -282,34 +282,32 @@ fn parse_lenm(body: &[u8]) -> Result<Vec<EnumDef>> {
 }
 
 fn parse_psin_instances(body: &[u8], structs: &[StructDef]) -> Result<Option<Dom>> {
-    // Look for the root document struct 0xde396fe2
     let root_hash: u32 = 0xde396fe2;
-    let root_struct = structs.iter().find(|s| s.name_hash == root_hash);
-    if root_struct.is_none() {
+    if !structs.iter().any(|s| s.name_hash == root_hash) {
         return Ok(None);
     }
 
-    // Scan instance blocks: 16-byte header {type_hash, size, 0xAA×8}
+    // Block header table: contiguous N x 16-byte {type_hash, size, 0xAA×8} at body[0].
+    // Data region follows after padding to 16-byte file alignment.
+    let mut headers: Vec<(u32, usize)> = Vec::new();
     let mut pos = 0;
+    while pos + 16 <= body.len() && body[pos + 8..pos + 16] == [0xAA; 8] {
+        headers.push((le32(body, pos), le32(body, pos + 4) as usize));
+        pos += 16;
+    }
+    if headers.is_empty() { return Ok(None); }
+
+    // PSIN section starts at file offset 0, so body is at file offset 8.
+    // Data starts at align16(8 + N*16) in the file = align16(8 + N*16) - 8 in body.
+    let n = headers.len();
+    let mut file_off = (8 + n * 16 + 15) & !15;
     let mut blocks: Vec<(u32, &[u8])> = Vec::new();
-    while pos + 16 <= body.len() {
-        let sentinel = &body[pos + 8..pos + 16];
-        if sentinel == [0xAA; 8] {
-            let type_hash = le32(body, pos);
-            let size = le32(body, pos + 4) as usize;
-            let block_start = pos + 16;
-            let block_end = (block_start + size).min(body.len());
-            blocks.push((type_hash, &body[block_start..block_end]));
-            pos = block_end;
-            // Skip delimiter (pppppppp)
-            if pos + 8 <= body.len() && &body[pos..pos + 8] == b"pppppppp" {
-                pos += 8;
-            }
-            // 16-byte align
-            pos = (pos + 15) & !15;
-        } else {
-            pos += 4;
-        }
+    for &(type_hash, size) in &headers {
+        let body_off = file_off - 8;
+        let end = (body_off + size).min(body.len());
+        if body_off > body.len() { break; }
+        blocks.push((type_hash, &body[body_off..end]));
+        file_off = (file_off + size + 15) & !15;
     }
 
     // Find the root document block

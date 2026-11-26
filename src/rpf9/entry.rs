@@ -53,14 +53,15 @@ pub fn has_graph_magic(plain: &[u8]) -> bool {
 }
 
 /// Decodes a 24-byte record `{u32 offset/16, u32 flags, u64 stored size/16, u64 decoded size}`
-/// into `(byte offset, flags, stored bytes, decoded bytes)`. The decoded size is the exact
-/// content length: the inflated length of a zlib chain, or the unpadded length of a raw payload.
+/// into `(byte offset, flags, stored bytes, decoded bytes)`. Bit 0 of the flags word is the
+/// 33rd bit of the offset (archives larger than 64 GiB need it).
 fn decode(bytes: &[u8]) -> Option<(u64, u32, u64, u64)> {
     if bytes.len() < RECORD { return None; }
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
     let quad = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-    let (units, stored) = (word(0), quad(8));
-    (units != 0 && stored != 0).then(|| (u64::from(units) * 16, word(4), stored.saturating_mul(16), quad(16)))
+    let (units, flags, stored) = (word(0), word(4), quad(8));
+    let offset = (u64::from(units) | u64::from(flags & 1) << 32) * 16;
+    (units != 0 && stored != 0).then(|| (offset, flags & !1, stored.saturating_mul(16), quad(16)))
 }
 
 /// Decodes a wide record (stride > 24, likely 32 bytes): `{u64 offset_units, u64 unknown, u64
@@ -75,8 +76,13 @@ fn decode_wide(bytes: &[u8], stride: usize) -> Option<(u64, u32, u64, u64)> {
 }
 
 /// Rewrites a record's location and sizes in place, keeping its flags.
+/// Bit 0 of the flags word (record[4..8]) carries the 33rd bit of the offset.
 pub fn encode_location(record: &mut [u8], offset: u64, stored: u64, decoded: u64) {
-    record[0..4].copy_from_slice(&((offset / 16) as u32).to_le_bytes());
+    let units = offset / 16;
+    record[0..4].copy_from_slice(&(units as u32).to_le_bytes());
+    let mut flags = u32::from_le_bytes(record[4..8].try_into().unwrap());
+    flags = (flags & !1) | ((units >> 32) as u32 & 1);
+    record[4..8].copy_from_slice(&flags.to_le_bytes());
     record[8..16].copy_from_slice(&stored.div_ceil(16).to_le_bytes());
     record[16..24].copy_from_slice(&decoded.to_le_bytes());
 }
