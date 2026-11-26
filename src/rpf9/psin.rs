@@ -402,22 +402,26 @@ pub fn print_summary(container: &PsinContainer) {
     }
 }
 
+pub fn member_type_name(code: u8) -> &'static str {
+    match code {
+        0x01 => "bool", 0x05 => "struct", 0x07 => "ptr",
+        0x10 | 0x11 => "u8", 0x12 | 0x13 => "u16",
+        0x14 => "i32/f32", 0x15 => "u32", 0x16 | 0x17 | 0x18 => "u64",
+        0x20..=0x22 => "vec3", 0x23 | 0x24 => "vec4",
+        0x44 => "string", 0x48 => "hash_string", 0x4A => "joaat",
+        0x50 => "array_fixed", 0x52 => "array_ptr", 0x5C => "array_counted",
+        0x60 => "enum_u8", 0x65 => "bitset",
+        _ => "?",
+    }
+}
+
 /// Print struct definitions with member details.
 pub fn print_structs(container: &PsinContainer, limit: usize, dict: &crate::rpf9::hashes::Dict) {
     for (i, s) in container.structs.iter().take(limit).enumerate() {
         println!("  struct #{i} hash={} sig={:#010x} size={} members={}",
             dict.fmt(s.name_hash), s.signature, s.size, s.members.len());
         for m in &s.members {
-            let type_name = match m.type_code {
-                0x01 => "bool", 0x05 => "struct", 0x07 => "ptr",
-                0x10 | 0x11 => "u8", 0x12 | 0x13 => "u16",
-                0x14 => "i32/f32", 0x15 => "u32", 0x16 | 0x17 | 0x18 => "u64",
-                0x20..=0x22 => "vec3", 0x23 | 0x24 => "vec4",
-                0x44 => "string", 0x48 => "hash_string", 0x4A => "joaat",
-                0x50 => "array_fixed", 0x52 => "array_ptr", 0x5C => "array_counted",
-                0x60 => "enum_u8", 0x65 => "bitset",
-                _ => "?",
-            };
+            let type_name = member_type_name(m.type_code);
             // name 0x100 marks an anonymous array-element descriptor
             let name = if m.name_hash == 0x100 { "<item>".to_string() } else { dict.fmt(m.name_hash) };
             let target = if m.extra != 0 { format!(" -> {}", dict.fmt(m.extra)) } else { String::new() };

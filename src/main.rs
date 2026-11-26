@@ -54,6 +54,13 @@ enum Command {
         #[arg(required = true)]
         archives: Vec<PathBuf>,
     },
+    /// Collect all unique PSIN struct and enum definitions across archives into a schema database
+    SchemaDb {
+        #[arg(required = true)]
+        archives: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Catalog every entry (with nested RPF9s) of the archives: path, name hash, name or candidates, kind, sizes
     Catalog {
         #[arg(required = true)]
@@ -490,6 +497,7 @@ fn main() -> Result<()> {
             Err(e) => { eprintln!("Error: {e:?}"); std::process::exit(2) }
         },
         Command::Harvest { archives } => cmd_harvest(&archives, &crypto, &dict),
+        Command::SchemaDb { archives, json } => cmd_schema_db(&archives, &crypto, &dict, json),
         Command::Catalog { archives, json, write_dict } => cmd_catalog(&archives, &crypto, &dict, json, write_dict.as_deref()),
         Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
@@ -1004,6 +1012,62 @@ fn cmd_harvest(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &r
     let (unknown, found) = harvest(&archives, crypto, dict)?;
     for (h, name) in &found { println!("{h:#010x} {name}"); }
     eprintln!("named {} of {unknown} unknown PSIN schema hashes", found.len());
+    Ok(())
+}
+
+fn cmd_schema_db(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool) -> Result<()> {
+    use std::collections::BTreeMap;
+    let raws = paths.iter().map(|p| map_file(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
+    let archives = raws.iter().map(|r| rpf9::reader::Archive::open(r, crypto)).collect::<Result<Vec<_>>>()?;
+    // ponytail: BTreeMap for deterministic output order; linear scan is fine for ~100 unique structs
+    let mut structs: BTreeMap<u32, (rpf9::psin::StructDef, usize)> = BTreeMap::new();
+    let mut enums: BTreeMap<u32, (rpf9::psin::EnumDef, usize)> = BTreeMap::new();
+    let mut psin_count = 0usize;
+    for archive in &archives { walk(archive, "", crypto, &mut |_, a, e, nested| {
+        if nested || a.head(e, 4) != b"PSIN" { return; }
+        let Ok(c) = rpf9::psin::PsinContainer::parse(&content(a, e)) else { return };
+        psin_count += 1;
+        for s in &c.structs {
+            structs.entry(s.name_hash).and_modify(|(_, n)| *n += 1).or_insert_with(|| (s.clone(), 1));
+        }
+        for en in &c.enums {
+            enums.entry(en.name_hash).and_modify(|(_, n)| *n += 1).or_insert_with(|| (en.clone(), 1));
+        }
+    })?; }
+    if json {
+        println!("{{\"psin_entries\":{psin_count},\"structs\":[");
+        for (i, (_, (s, count))) in structs.iter().enumerate() {
+            let members: Vec<String> = s.members.iter().map(|m| {
+                format!("{{\"hash\":\"{:#010x}\",\"name\":\"{}\",\"offset\":{},\"type\":\"{}\",\"extra\":\"{:#010x}\"}}",
+                    m.name_hash, dict.xml_name(m.name_hash), m.offset, rpf9::psin::member_type_name(m.type_code), m.extra)
+            }).collect();
+            let comma = if i + 1 < structs.len() { "," } else { "" };
+            println!("  {{\"hash\":\"{:#010x}\",\"name\":\"{}\",\"size\":{},\"seen\":{count},\"members\":[{}]}}{comma}",
+                s.name_hash, dict.xml_name(s.name_hash), s.size, members.join(","));
+        }
+        println!("],\"enums\":[");
+        for (i, (_, (en, count))) in enums.iter().enumerate() {
+            let vals: Vec<String> = en.values.iter().map(|(v, h)| format!("[{v},{h}]")).collect();
+            let comma = if i + 1 < enums.len() { "," } else { "" };
+            println!("  {{\"hash\":\"{:#010x}\",\"name\":\"{}\",\"seen\":{count},\"values\":[{}]}}{comma}",
+                en.name_hash, dict.xml_name(en.name_hash), vals.join(","));
+        }
+        println!("]}}");
+    } else {
+        println!("{psin_count} PSIN entries, {} unique structs, {} unique enums\n", structs.len(), enums.len());
+        for (_, (s, count)) in &structs {
+            println!("=== Struct {} size={:#x} members={} seen_in={count} ===", dict.xml_name(s.name_hash), s.size, s.members.len());
+            for m in &s.members {
+                let name = if m.name_hash == 0x100 { "<item>".to_string() } else { dict.xml_name(m.name_hash) };
+                let target = if m.extra != 0 { format!(" -> {}", dict.xml_name(m.extra)) } else { String::new() };
+                println!("  +{:#06x} {:<13} {name}{target}", m.offset, rpf9::psin::member_type_name(m.type_code));
+            }
+        }
+        for (_, (en, count)) in &enums {
+            let vals: Vec<String> = en.values.iter().map(|(v, h)| format!("{v}={h:#010x}")).collect();
+            println!("\n=== Enum {} seen_in={count} ===\n  {}", dict.xml_name(en.name_hash), vals.join(", "));
+        }
+    }
     Ok(())
 }
 
