@@ -62,6 +62,7 @@ pub struct Dom {
     pub attributes: Vec<DomAttr>,
     pub strings: Vec<String>,
     pub vectors: Vec<[f32; 3]>,
+    pub u64_table: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,72 @@ impl DomAttr {
             4 => "bool",
             5 => "hash64",
             _ => "unknown",
+        }
+    }
+}
+
+impl Dom {
+    /// Render as XML using the hash dictionary for name resolution.
+    pub fn to_xml(&self, dict: &crate::rpf9::hashes::Dict) -> String {
+        let mut out = String::from("<?xml version=\"1.0\"?>\n");
+        if self.nodes.is_empty() { return out; }
+        self.write_node(0, 0, dict, &mut out);
+        out
+    }
+
+    fn write_node(&self, idx: usize, depth: usize, dict: &crate::rpf9::hashes::Dict, out: &mut String) {
+        let node = &self.nodes[idx];
+        let indent: String = "  ".repeat(depth);
+        let name = dict.fmt(node.name_hash);
+
+        let attrs: Vec<String> = (0..node.attr_count as usize).filter_map(|i| {
+            let a = self.attributes.get(node.attr_start as usize + i)?;
+            let aname = dict.fmt(a.name_hash);
+            let val = self.format_attr(a, dict);
+            Some(format!("{aname}=\"{val}\""))
+        }).collect();
+
+        let attr_str = if attrs.is_empty() { String::new() } else { format!(" {}", attrs.join(" ")) };
+
+        if node.child == 0xFFFF {
+            out.push_str(&format!("{indent}<{name}{attr_str} />\n"));
+        } else {
+            out.push_str(&format!("{indent}<{name}{attr_str}>\n"));
+            let mut ci = node.child as usize;
+            // depth cap guards against cyclic child/sibling links in malformed data
+            while ci < self.nodes.len() && depth < 64 {
+                self.write_node(ci, depth + 1, dict, out);
+                let sib = self.nodes[ci].sibling;
+                if sib == 0xFFFF { break; }
+                ci = sib as usize;
+            }
+            out.push_str(&format!("{indent}</{name}>\n"));
+        }
+    }
+
+    fn format_attr(&self, a: &DomAttr, dict: &crate::rpf9::hashes::Dict) -> String {
+        match a.attr_type {
+            0 => dict.fmt(a.raw_value),
+            1 => {
+                let vi = a.raw_value as usize;
+                if let Some(v) = self.vectors.get(vi) {
+                    format!("{:.6}, {:.6}, {:.6}", v[0], v[1], v[2])
+                } else {
+                    format!("vec3[{vi}]")
+                }
+            }
+            2 => format!("{:.6}", f32::from_bits(a.raw_value)),
+            3 => format!("{}", a.raw_value as i32),
+            4 => if a.raw_value != 0 { "true".into() } else { "false".into() },
+            5 => {
+                let ui = a.raw_value as usize;
+                if let Some(&h) = self.u64_table.get(ui) {
+                    format!("{h:#018x}")
+                } else {
+                    format!("u64[{ui}]")
+                }
+            }
+            _ => format!("{:#010x}", a.raw_value),
         }
     }
 }
@@ -135,6 +202,18 @@ impl PsinContainer {
 
 fn le32(data: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+}
+
+fn le16(data: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
+}
+
+fn le64(data: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+}
+
+fn f32_le(data: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes(data[off..off + 4].try_into().unwrap())
 }
 
 fn parse_lsch(body: &[u8]) -> Result<Vec<StructDef>> {
@@ -243,14 +322,73 @@ fn parse_psin_instances(body: &[u8], structs: &[StructDef]) -> Result<Option<Dom
         return Ok(None);
     }
 
-    // Parse the DOM arrays from the root struct (0x50 bytes, 5 arrays)
-    // For now, just report what we found
-    Ok(Some(Dom {
-        nodes: Vec::new(),
-        attributes: Vec::new(),
-        strings: Vec::new(),
-        vectors: Vec::new(),
-    }))
+    // DOM layout derived from rage9-re format documentation.
+
+    // Helper: read an atArray ref from the root block and resolve its pool.
+    let read_pool = |arr_off: usize| -> Option<(usize, &[u8])> {
+        let count = le32(root_data, arr_off) as usize;
+        if count == 0 { return Some((0, &[])); }
+        let pool_ref = le64(root_data, arr_off + 8);
+        let blk_idx = (pool_ref & 0xFFF) as usize;
+        let byte_off = (pool_ref >> 20) as usize;
+        if blk_idx == 0 { return None; }
+        let pool = blocks.get(blk_idx - 1)?.1;
+        if byte_off <= pool.len() { Some((count, &pool[byte_off..])) } else { None }
+    };
+
+    let mut attributes = Vec::new();
+    if let Some((n, pool)) = read_pool(0x00) {
+        for i in 0..n {
+            let o = i * 16;
+            if o + 16 > pool.len() { break; }
+            attributes.push(DomAttr {
+                name_hash: le32(pool, o),
+                value_hash: le32(pool, o + 4),
+                raw_value: le32(pool, o + 8),
+                attr_type: pool[o + 12],
+            });
+        }
+    }
+
+    // Strings (+0x10): skipped for now
+    let strings = Vec::new();
+
+    let mut vectors = Vec::new();
+    if let Some((n, pool)) = read_pool(0x20) {
+        for i in 0..n {
+            let o = i * 12;
+            if o + 12 > pool.len() { break; }
+            vectors.push([f32_le(pool, o), f32_le(pool, o + 4), f32_le(pool, o + 8)]);
+        }
+    }
+
+    let mut u64_table = Vec::new();
+    if let Some((n, pool)) = read_pool(0x30) {
+        for i in 0..n {
+            let o = i * 8;
+            if o + 8 > pool.len() { break; }
+            u64_table.push(le64(pool, o));
+        }
+    }
+
+    let mut nodes = Vec::new();
+    if let Some((n, pool)) = read_pool(0x40) {
+        for i in 0..n {
+            let o = i * 16;
+            if o + 16 > pool.len() { break; }
+            nodes.push(DomNode {
+                name_hash: le32(pool, o),
+                parent: le16(pool, o + 4),
+                child: le16(pool, o + 6),
+                sibling: le16(pool, o + 8),
+                prev_sibling: le16(pool, o + 10),
+                attr_start: le16(pool, o + 12),
+                attr_count: pool[o + 14],
+            });
+        }
+    }
+
+    Ok(Some(Dom { nodes, attributes, strings, vectors, u64_table }))
 }
 
 /// Print a PSIN container summary.
@@ -261,8 +399,9 @@ pub fn print_summary(container: &PsinContainer) {
     }
     println!("  {} struct definitions, {} enum definitions",
         container.structs.len(), container.enums.len());
-    if container.dom.is_some() {
-        println!("  DOM: present (binary-XML tree)");
+    if let Some(dom) = &container.dom {
+        println!("  DOM: {} nodes, {} attributes, {} vec3, {} u64",
+            dom.nodes.len(), dom.attributes.len(), dom.vectors.len(), dom.u64_table.len());
     }
 }
 
@@ -295,6 +434,15 @@ pub fn print_structs(container: &PsinContainer, limit: usize, dict: &crate::rpf9
     for e in &container.enums {
         let values: Vec<String> = e.values.iter().map(|(v, h)| format!("{v}={h:#010x}")).collect();
         println!("  enum {} [{}]", dict.fmt(e.name_hash), values.join(", "));
+    }
+}
+
+/// Print the DOM as XML.
+pub fn print_dom(container: &PsinContainer, dict: &crate::rpf9::hashes::Dict) {
+    if let Some(dom) = &container.dom {
+        print!("{}", dom.to_xml(dict));
+    } else {
+        println!("  (no DOM)");
     }
 }
 

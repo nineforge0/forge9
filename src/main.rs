@@ -102,6 +102,9 @@ enum Command {
         /// Max structs to show
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Dump DOM as XML
+        #[arg(long)]
+        xml: bool,
     },
     /// Recursively list nested RPF9 archives
     Tree {
@@ -476,7 +479,7 @@ fn main() -> Result<()> {
         Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
-        Command::Psin { archive, index, structs, limit } => cmd_psin(&archive, &crypto, index, structs, limit, &dict),
+        Command::Psin { archive, index, structs, limit, xml } => cmd_psin(&archive, &crypto, index, structs, limit, xml, &dict),
         Command::PedMeta { archive, index, variations, part, normal } => {
             let hex = |s: Option<String>| s.map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).with_context(|| format!("bad hex id {s:?}"))).transpose();
             cmd_ped_meta(&load_entry(&archive, &crypto, &index)?, variations, hex(part)?, hex(normal)?)
@@ -1055,7 +1058,7 @@ fn cmd_repack(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, patches: &[S
     Ok(())
 }
 
-fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, show_structs: bool, limit: usize, dict: &rpf9::hashes::Dict) -> Result<()> {
+fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, show_structs: bool, limit: usize, xml: bool, dict: &rpf9::hashes::Dict) -> Result<()> {
     let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let entry = archive.entries().get(index)
@@ -1075,6 +1078,7 @@ fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, 
                 let container = rpf9::psin::PsinContainer::parse(&nb)?;
                 rpf9::psin::print_summary(&container);
                 if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
+                if xml { rpf9::psin::print_dom(&container, dict); }
             }
         }
         if found == 0 { println!("  no PSIN entries in nested archive"); }
@@ -1088,6 +1092,7 @@ fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, 
     let container = rpf9::psin::PsinContainer::parse(&bytes)?;
     rpf9::psin::print_summary(&container);
     if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
+    if xml { rpf9::psin::print_dom(&container, dict); }
     Ok(())
 }
 
