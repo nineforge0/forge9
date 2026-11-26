@@ -26,7 +26,6 @@ impl<'a> Archive<'a> {
         // The key whose plaintext holds the record table (24-byte/wide, else compact) with the most entries.
         let mut best: Option<(usize, usize, usize, Vec<u8>, bool)> = None; // (run, start, stride, plain, compact)
         let mut best_key = 0;
-        let header_stride = header.entry_stride();
         for index in 0..crypto.key_count() {
             let schedule = crypto.schedule(index)?;
             let mut plain = ciphertext.to_vec();
@@ -39,17 +38,12 @@ impl<'a> Archive<'a> {
                 best_key = index;
             }
         }
-        let Some((run, start, stride, plain, compact)) = best else {
+        let Some((run, start, _stride, plain, compact)) = best else {
             if declared > 0 { bail!("no table records recovered with any key"); }
             return Ok(Self { data, header, entries: Vec::new(), key_index: 0 });
         };
-        if !compact && stride != header_stride {
-            eprintln!("rpf9: column stride {stride} != header stride {header_stride}");
-        }
         let mut entries = if compact {
             entry::parse_compact(&plain, start, run)
-        } else if stride > entry::RECORD {
-            entry::parse_wide(&plain, start, run, stride)
         } else {
             entry::parse(&plain, start, run)
         };
