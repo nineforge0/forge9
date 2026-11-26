@@ -366,6 +366,21 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         widths: Option<Vec<u8>>,
     },
+    /// Parse a serialised object graph (script.rpf typed object forest)
+    ObjectGraph {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+        /// Disassemble one root tree by root_id (hex)
+        #[arg(long)]
+        tree: Option<String>,
+        /// Full type distribution
+        #[arg(long)]
+        census: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Create, verify and apply mod packs
     #[command(subcommand)]
     Mod(ModCommand),
@@ -505,6 +520,7 @@ fn main() -> Result<()> {
         Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
+        Command::ObjectGraph { archive, index, tree, census, json } => cmd_object_graph(&load_entry(&archive, &crypto, &index)?, tree, census, json),
         Command::Model { archive, index, output, obj, lod, textures, dedup, ped_meta, dump_buffers, materials_json } => {
             let raw = map_file(&archive)?;
             let variations = match &ped_meta {
@@ -1441,6 +1457,53 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
         println!("  drawable dictionary, {} drawables (export with `model`)", members.len());
     } else if drawable::looks_like(bytes) {
         println!("  standalone drawable (export with `model`)");
+    }
+    Ok(())
+}
+
+fn cmd_object_graph(bytes: &[u8], tree: Option<String>, census: bool, json: bool) -> Result<()> {
+    let graph = formats::object_graph::ObjectGraph::parse(bytes)?;
+    if let Some(root_hex) = tree {
+        let root_id = u32::from_str_radix(root_hex.trim_start_matches("0x"), 16)
+            .with_context(|| format!("bad root_id hex: {root_hex:?}"))?;
+        match graph.dump_tree(root_id) {
+            Some(text) => print!("{text}"),
+            None => anyhow::bail!("no root with root_id {root_id:#x}"),
+        }
+        return Ok(());
+    }
+    let types = graph.type_census();
+    if census {
+        let mut sorted: Vec<_> = types.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        if json {
+            let map: serde_json::Map<String, serde_json::Value> = sorted.iter()
+                .map(|(h, c)| (format!("{h:#018x}"), serde_json::Value::from(*c))).collect();
+            println!("{}", serde_json::to_string_pretty(&map)?);
+        } else {
+            for (hash, count) in &sorted {
+                println!("  {hash:#018x}: {count}");
+            }
+            println!("{} distinct types, {} records", sorted.len(), graph.records.len());
+        }
+        return Ok(());
+    }
+    // Default: summary
+    let pointer_count: usize = graph.records.iter().map(|r| r.pointers.len()).sum();
+    if json {
+        let mut sorted: Vec<_> = types.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let top10: serde_json::Map<String, serde_json::Value> = sorted.iter().take(10)
+            .map(|(h, c)| (format!("{h:#018x}"), serde_json::Value::from(*c))).collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "records": graph.records.len(),
+            "roots": graph.root_indices.len(),
+            "pointers": pointer_count,
+            "distinct_types": sorted.len(),
+            "top_types": top10,
+        }))?);
+    } else {
+        print!("{}", graph.summary());
     }
     Ok(())
 }
