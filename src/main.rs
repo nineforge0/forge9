@@ -101,8 +101,8 @@ enum Command {
     /// Inspect PSIN game data in an entry
     Psin {
         archive: PathBuf,
-        /// Entry index containing PSIN data
-        index: usize,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
         /// Show struct definitions
         #[arg(long)]
         structs: bool,
@@ -502,7 +502,7 @@ fn main() -> Result<()> {
         Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
-        Command::Psin { archive, index, structs, limit, xml } => cmd_psin(&archive, &crypto, index, structs, limit, xml, &dict),
+        Command::Psin { archive, index, structs, limit, xml } => cmd_psin(&archive, &crypto, &index, structs, limit, xml, &dict),
         Command::PedMeta { archive, index, variations, part, normal } => {
             let hex = |s: Option<String>| s.map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).with_context(|| format!("bad hex id {s:?}"))).transpose();
             cmd_ped_meta(&load_entry(&archive, &crypto, &index)?, variations, hex(part)?, hex(normal)?)
@@ -1138,12 +1138,8 @@ fn cmd_repack(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, patches: &[S
     Ok(())
 }
 
-fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, show_structs: bool, limit: usize, xml: bool, dict: &rpf9::hashes::Dict) -> Result<()> {
-    let raw = map_file(path)?;
-    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
-    let entry = archive.entries().get(index)
-        .ok_or_else(|| anyhow::anyhow!("entry index {index} out of range"))?;
-    let bytes = archive.read_entry(entry)?;
+fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str, show_structs: bool, limit: usize, xml: bool, dict: &rpf9::hashes::Dict) -> Result<()> {
+    let bytes = load_entry(path, crypto, index)?;
 
     // Check if it's a nested RPF9 containing PSIN
     if bytes.starts_with(b"9FPR") {
