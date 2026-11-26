@@ -110,11 +110,11 @@ impl Dom {
     fn write_node(&self, idx: usize, depth: usize, dict: &crate::rpf9::hashes::Dict, out: &mut String) {
         let node = &self.nodes[idx];
         let indent: String = "  ".repeat(depth);
-        let name = dict.fmt(node.name_hash);
+        let name = dict.xml_name(node.name_hash);
 
         let attrs: Vec<String> = (0..node.attr_count as usize).filter_map(|i| {
             let a = self.attributes.get(node.attr_start as usize + i)?;
-            let aname = dict.fmt(a.name_hash);
+            let aname = dict.xml_name(a.name_hash);
             let val = self.format_attr(a, dict);
             Some(format!("{aname}=\"{val}\""))
         }).collect();

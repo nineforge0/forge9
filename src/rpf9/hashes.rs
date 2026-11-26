@@ -70,6 +70,14 @@ impl Dict {
             None => format!("{hash:#010x}"),
         }
     }
+
+    /// XML-safe name: resolved name if known, else `h_DEADBEEF`.
+    pub fn xml_name(&self, hash: u32) -> String {
+        match self.name(hash) {
+            Some(n) => n.to_string(),
+            None => format!("h_{hash:08x}"),
+        }
+    }
 }
 
 /// `hash name` per line, hash in hex (optional 0x); blank and `#` lines ignored.
