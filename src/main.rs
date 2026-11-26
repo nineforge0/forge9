@@ -54,6 +54,13 @@ enum Command {
         #[arg(required = true)]
         archives: Vec<PathBuf>,
     },
+    /// Collect all unique PSIN struct and enum definitions across archives into a schema database
+    SchemaDb {
+        #[arg(required = true)]
+        archives: Vec<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Catalog every entry (with nested RPF9s) of the archives: path, name hash, name or candidates, kind, sizes
     Catalog {
         #[arg(required = true)]
@@ -102,6 +109,9 @@ enum Command {
         /// Max structs to show
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Dump DOM as XML
+        #[arg(long)]
+        xml: bool,
     },
     /// Recursively list nested RPF9 archives
     Tree {
@@ -135,11 +145,30 @@ enum Command {
         #[arg(long)]
         min_size: Option<u64>,
         /// Byte string to find in inflated content (slow)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "grep_hex")]
         grep: Option<String>,
+        /// Bytes to find in inflated content, as hex (e.g. a little-endian texture key: 2454854...)
+        #[arg(long)]
+        grep_hex: Option<String>,
         /// Only entries that `model` can export, with their mesh counts per LOD (slow)
         #[arg(long)]
         drawable: bool,
+    },
+    /// Ped metadata PSIN: the part table (one record per drawable of a character pack) and the
+    /// texture variation records (part id, diffuse or region-map key, normal key)
+    PedMeta {
+        archive: PathBuf,
+        /// Entry index, `a/b` for nested archives
+        index: String,
+        /// List texture variation records
+        #[arg(long)]
+        variations: bool,
+        /// Only variation records of this part id (hex)
+        #[arg(long)]
+        part: Option<String>,
+        /// Only variation records with this normal key (hex), e.g. a drawable's bound bumptex key
+        #[arg(long)]
+        normal: Option<String>,
     },
     /// Compute the joaat hash of a name
     Hash { name: String },
@@ -260,6 +289,10 @@ enum Command {
         /// Archive whose EDUP tables map deduplicated texture keys (default: textures.rpf next to the archive)
         #[arg(long)]
         dedup: Option<PathBuf>,
+        /// Ped-meta PSIN entry of the archive (e.g. 5): materials without `diffusetex` get the diffuse key of the
+        /// variation record whose normal key equals their `bumptex` key (clothing binds `materialid`, not a diffuse)
+        #[arg(long)]
+        ped_meta: Option<String>,
         /// Write each geometry's stored vertex, index and meshlet buffers and a reference JSON here
         /// (no model is written unless -o or --obj is also given)
         #[arg(long)]
@@ -339,6 +372,21 @@ enum Command {
         /// Override the lane symbol widths, e.g. `4,4,8,8,6,6,6,6,6,6,6,6`
         #[arg(long, value_delimiter = ',')]
         widths: Option<Vec<u8>>,
+    },
+    /// Parse a serialised object graph (script.rpf typed object forest)
+    ObjectGraph {
+        archive: PathBuf,
+        /// Entry index; `5/3` descends into nested RPF9s
+        index: String,
+        /// Disassemble one root tree by root_id (hex)
+        #[arg(long)]
+        tree: Option<String>,
+        /// Full type distribution
+        #[arg(long)]
+        census: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Create, verify and apply mod packs
     #[command(subcommand)]
@@ -449,16 +497,22 @@ fn main() -> Result<()> {
             Err(e) => { eprintln!("Error: {e:?}"); std::process::exit(2) }
         },
         Command::Harvest { archives } => cmd_harvest(&archives, &crypto, &dict),
+        Command::SchemaDb { archives, json } => cmd_schema_db(&archives, &crypto, &dict, json),
         Command::Catalog { archives, json, write_dict } => cmd_catalog(&archives, &crypto, &dict, json, write_dict.as_deref()),
         Command::Extract { archive, output, select } => cmd_extract(&archive, &crypto, &output, select),
         Command::Hexdump { archive, index, limit } => cmd_hexdump(&archive, &crypto, index, limit),
         Command::Replace { archive, index, file, output } => cmd_replace(&archive, &crypto, index, &file, &output),
-        Command::Psin { archive, index, structs, limit } => cmd_psin(&archive, &crypto, index, structs, limit, &dict),
+        Command::Psin { archive, index, structs, limit, xml } => cmd_psin(&archive, &crypto, index, structs, limit, xml, &dict),
+        Command::PedMeta { archive, index, variations, part, normal } => {
+            let hex = |s: Option<String>| s.map(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).with_context(|| format!("bad hex id {s:?}"))).transpose();
+            cmd_ped_meta(&load_entry(&archive, &crypto, &index)?, variations, hex(part)?, hex(normal)?)
+        }
         Command::Tree { archive, depth } => cmd_tree(&archive, &crypto, depth),
         Command::Repack { archive, patch, output, verify } => cmd_repack(&archive, &crypto, &patch, &output, verify),
-        Command::Search { archive, magic, ext, min_size, grep, drawable } => {
-            let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep: grep.map(String::into_bytes), drawable };
-            let raw = std::fs::read(&archive)?;
+        Command::Search { archive, magic, ext, min_size, grep, grep_hex, drawable } => {
+            let grep = match grep_hex { Some(h) => Some(parse_hex(&h)?), None => grep.map(String::into_bytes) };
+            let filter = SearchFilter { magic: magic.map(String::into_bytes), ext, min_size, grep, drawable };
+            let raw = map_file(&archive)?;
             let hits = search(&raw, &archive.display().to_string(), &crypto, &filter)?;
             println!("{hits} matches");
             Ok(())
@@ -474,8 +528,13 @@ fn main() -> Result<()> {
         Command::Disasm { archive, index, shader, raw } => cmd_disasm(&load_entry(&archive, &crypto, &index)?, shader, raw),
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
-        Command::Model { archive, index, output, obj, lod, textures, dedup, dump_buffers, materials_json } => {
-            let raw = std::fs::read(&archive)?;
+        Command::ObjectGraph { archive, index, tree, census, json } => cmd_object_graph(&load_entry(&archive, &crypto, &index)?, tree, census, json),
+        Command::Model { archive, index, output, obj, lod, textures, dedup, ped_meta, dump_buffers, materials_json } => {
+            let raw = map_file(&archive)?;
+            let variations = match &ped_meta {
+                Some(i) => formats::pedmeta::variations(&entry_blocks(&raw, &crypto, i)?.concat())?,
+                None => Vec::new(),
+            };
             let parts = index.iter().map(|i| Ok((i.as_str(), entry_blocks(&raw, &crypto, i)?))).collect::<Result<Vec<_>>>()?;
             drop(raw);
             if let Some(out) = &dump_buffers {
@@ -496,7 +555,7 @@ fn main() -> Result<()> {
                 found.sort();
                 found
             };
-            cmd_model(&parts, output, obj, lod, &textures, &dedup, &dict, materials_json)
+            cmd_model(&parts, output, obj, lod, &textures, &dedup, &variations, &dict, materials_json)
         }
         Command::Mod(ModCommand::Apply { manifest, output, archive, verify }) => {
             let m = modding::manifest::Manifest::load(&manifest)?;
@@ -513,20 +572,25 @@ fn main() -> Result<()> {
 }
 
 fn cmd_info(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext) -> Result<()> {
-    let raw = std::fs::read(path)?;
-    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
-    let h = archive.header();
+    let raw = map_file(path)?;
+    // Parse and print header before Archive::open so we see stride/flags even when open fails
+    let h = rpf9::header::Header::parse(&raw)?;
     println!("{} ({} bytes)", path.display(), raw.len());
-    println!("  version {}.{} gen {:#x} key #{}", h.version_high, h.version_low, h.generation(), archive.key_index());
+    println!("  version {}.{} gen {:#x}", h.version_high, h.version_low, h.generation());
     println!("  entries {} payload {:#x} split {:#x} trailer {:#x}", h.entry_count, h.payload_start, h.split, h.trailer_size);
-    println!("  key_id {:#x} flags {:#x} stride {}", h.key_id, h.flags, h.entry_stride());
-    let zlib = archive.entries().iter().filter(|e| e.is_zlib(&raw)).count();
-    println!("  {} entries ({} zlib, {} raw)", archive.entries().len(), zlib, archive.entries().len() - zlib);
+    println!("  key_id {:#x} flags {:#x} stride {} alignment {:#x}", h.key_id, h.flags, h.entry_stride(), h.alignment);
+    match rpf9::reader::Archive::open(&raw, crypto) {
+        Ok(archive) => {
+            let zlib = archive.entries().iter().filter(|e| e.is_zlib(&raw)).count();
+            println!("  {} entries recovered ({} zlib, {} raw) key #{}", archive.entries().len(), zlib, archive.entries().len() - zlib, archive.key_index());
+        }
+        Err(e) => eprintln!("  open failed: {e}"),
+    }
     Ok(())
 }
 
 fn cmd_list(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, limit: usize, json: bool, recursive: bool) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let mut rows = Vec::new();
     if recursive {
@@ -613,7 +677,7 @@ fn stats(archive: &rpf9::reader::Archive, crypto: &rpf9::crypto::CryptoContext) 
 }
 
 fn cmd_stats(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, top: usize, json: bool) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let s = stats(&rpf9::reader::Archive::open(&raw, crypto)?, crypto)?;
     let largest = &s.largest[..top.min(s.largest.len())];
     if json {
@@ -695,7 +759,7 @@ fn diff(old: Vec<Leaf>, new: Vec<Leaf>) -> Diff {
 /// Prints the differences; true if the archives differ.
 fn cmd_diff(old: &PathBuf, new: &PathBuf, crypto: &rpf9::crypto::CryptoContext, json: bool) -> Result<bool> {
     let leaves_of = |path: &PathBuf| -> Result<Vec<Leaf>> {
-        let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let raw = map_file(path).with_context(|| format!("reading {}", path.display()))?;
         leaves(&rpf9::reader::Archive::open(&raw, crypto)?, crypto)
     };
     let d = diff(leaves_of(old)?, leaves_of(new)?);
@@ -903,7 +967,7 @@ fn catalog_dict_entries(rows: &[CatalogRow]) -> (Vec<(u32, String)>, usize) {
 }
 
 fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool, write_dict: Option<&std::path::Path>) -> Result<()> {
-    let raws = paths.iter().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
+    let raws = paths.iter().map(|p| map_file(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
     let archives = paths.iter().zip(&raws).map(|(p, r)| Ok((p.file_name().unwrap_or_default().to_string_lossy().into_owned(), rpf9::reader::Archive::open(r, crypto)?)))
         .collect::<Result<Vec<_>>>()?;
     let mut rows = catalog(&archives, crypto)?;
@@ -943,7 +1007,7 @@ fn cmd_catalog(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &r
 }
 
 fn cmd_harvest(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict) -> Result<()> {
-    let raws = paths.iter().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
+    let raws = paths.iter().map(|p| map_file(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
     let archives = raws.iter().map(|r| rpf9::reader::Archive::open(r, crypto)).collect::<Result<Vec<_>>>()?;
     let (unknown, found) = harvest(&archives, crypto, dict)?;
     for (h, name) in &found { println!("{h:#010x} {name}"); }
@@ -951,8 +1015,64 @@ fn cmd_harvest(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &r
     Ok(())
 }
 
+fn cmd_schema_db(paths: &[PathBuf], crypto: &rpf9::crypto::CryptoContext, dict: &rpf9::hashes::Dict, json: bool) -> Result<()> {
+    use std::collections::BTreeMap;
+    let raws = paths.iter().map(|p| map_file(p).with_context(|| format!("reading {}", p.display()))).collect::<Result<Vec<_>>>()?;
+    let archives = raws.iter().map(|r| rpf9::reader::Archive::open(r, crypto)).collect::<Result<Vec<_>>>()?;
+    // ponytail: BTreeMap for deterministic output order; linear scan is fine for ~100 unique structs
+    let mut structs: BTreeMap<u32, (rpf9::psin::StructDef, usize)> = BTreeMap::new();
+    let mut enums: BTreeMap<u32, (rpf9::psin::EnumDef, usize)> = BTreeMap::new();
+    let mut psin_count = 0usize;
+    for archive in &archives { walk(archive, "", crypto, &mut |_, a, e, nested| {
+        if nested || a.head(e, 4) != b"PSIN" { return; }
+        let Ok(c) = rpf9::psin::PsinContainer::parse(&content(a, e)) else { return };
+        psin_count += 1;
+        for s in &c.structs {
+            structs.entry(s.name_hash).and_modify(|(_, n)| *n += 1).or_insert_with(|| (s.clone(), 1));
+        }
+        for en in &c.enums {
+            enums.entry(en.name_hash).and_modify(|(_, n)| *n += 1).or_insert_with(|| (en.clone(), 1));
+        }
+    })?; }
+    if json {
+        println!("{{\"psin_entries\":{psin_count},\"structs\":[");
+        for (i, (_, (s, count))) in structs.iter().enumerate() {
+            let members: Vec<String> = s.members.iter().map(|m| {
+                format!("{{\"hash\":\"{:#010x}\",\"name\":\"{}\",\"offset\":{},\"type\":\"{}\",\"extra\":\"{:#010x}\"}}",
+                    m.name_hash, dict.xml_name(m.name_hash), m.offset, rpf9::psin::member_type_name(m.type_code), m.extra)
+            }).collect();
+            let comma = if i + 1 < structs.len() { "," } else { "" };
+            println!("  {{\"hash\":\"{:#010x}\",\"name\":\"{}\",\"size\":{},\"seen\":{count},\"members\":[{}]}}{comma}",
+                s.name_hash, dict.xml_name(s.name_hash), s.size, members.join(","));
+        }
+        println!("],\"enums\":[");
+        for (i, (_, (en, count))) in enums.iter().enumerate() {
+            let vals: Vec<String> = en.values.iter().map(|(v, h)| format!("[{v},{h}]")).collect();
+            let comma = if i + 1 < enums.len() { "," } else { "" };
+            println!("  {{\"hash\":\"{:#010x}\",\"name\":\"{}\",\"seen\":{count},\"values\":[{}]}}{comma}",
+                en.name_hash, dict.xml_name(en.name_hash), vals.join(","));
+        }
+        println!("]}}");
+    } else {
+        println!("{psin_count} PSIN entries, {} unique structs, {} unique enums\n", structs.len(), enums.len());
+        for (_, (s, count)) in &structs {
+            println!("=== Struct {} size={:#x} members={} seen_in={count} ===", dict.xml_name(s.name_hash), s.size, s.members.len());
+            for m in &s.members {
+                let name = if m.name_hash == 0x100 { "<item>".to_string() } else { dict.xml_name(m.name_hash) };
+                let target = if m.extra != 0 { format!(" -> {}", dict.xml_name(m.extra)) } else { String::new() };
+                println!("  +{:#06x} {:<13} {name}{target}", m.offset, rpf9::psin::member_type_name(m.type_code));
+            }
+        }
+        for (_, (en, count)) in &enums {
+            let vals: Vec<String> = en.values.iter().map(|(v, h)| format!("{v}={h:#010x}")).collect();
+            println!("\n=== Enum {} seen_in={count} ===\n  {}", dict.xml_name(en.name_hash), vals.join(", "));
+        }
+    }
+    Ok(())
+}
+
 fn cmd_extract(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, output: &PathBuf, select: Option<String>) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     std::fs::create_dir_all(output)?;
     let indices: Option<Vec<usize>> = select.map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect());
@@ -971,7 +1091,7 @@ fn cmd_extract(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, output: &Pa
 }
 
 fn cmd_hexdump(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, limit: usize) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let entry = archive.entries().get(index).ok_or_else(|| anyhow::anyhow!("index {index} out of range"))?;
     let bytes = archive.read_entry(entry)?;
@@ -1018,8 +1138,8 @@ fn cmd_repack(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, patches: &[S
     Ok(())
 }
 
-fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, show_structs: bool, limit: usize, dict: &rpf9::hashes::Dict) -> Result<()> {
-    let raw = std::fs::read(path)?;
+fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, show_structs: bool, limit: usize, xml: bool, dict: &rpf9::hashes::Dict) -> Result<()> {
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let entry = archive.entries().get(index)
         .ok_or_else(|| anyhow::anyhow!("entry index {index} out of range"))?;
@@ -1027,20 +1147,25 @@ fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, 
 
     // Check if it's a nested RPF9 containing PSIN
     if bytes.starts_with(b"9FPR") {
-        println!("entry #{index} is a nested RPF9: scanning for PSIN inside...");
+        eprintln!("entry #{index} is a nested RPF9: scanning for PSIN inside...");
         let nested = rpf9::reader::Archive::open(&bytes, crypto)?;
         let mut found = 0;
         for ne in nested.entries() {
             let nb = nested.read_entry(ne)?;
             if nb.starts_with(b"PSIN") {
                 found += 1;
-                println!("\n  nested entry #{} ({} bytes):", ne.index, nb.len());
                 let container = rpf9::psin::PsinContainer::parse(&nb)?;
-                rpf9::psin::print_summary(&container);
-                if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
+                if !xml {
+                    println!("\n  nested entry #{} ({} bytes):", ne.index, nb.len());
+                    rpf9::psin::print_summary(&container);
+                    if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
+                } else {
+                    rpf9::psin::print_dom(&container, dict);
+                }
             }
         }
-        if found == 0 { println!("  no PSIN entries in nested archive"); }
+        if found == 0 { eprintln!("  no PSIN entries in nested archive"); }
+        eprintln!("{found} PSIN entries processed");
         return Ok(());
     }
 
@@ -1051,11 +1176,39 @@ fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, 
     let container = rpf9::psin::PsinContainer::parse(&bytes)?;
     rpf9::psin::print_summary(&container);
     if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
+    if xml { rpf9::psin::print_dom(&container, dict); }
+    Ok(())
+}
+
+fn cmd_ped_meta(psin: &[u8], list: bool, part: Option<u64>, normal: Option<u64>) -> Result<()> {
+    use formats::pedmeta;
+    let blocks = pedmeta::blocks(psin)?;
+    println!("{} data blocks: {}", blocks.len(), blocks.iter().map(|b| format!("{:#x}+{:#x}", b.hash, b.size)).collect::<Vec<_>>().join(", "));
+    match pedmeta::parts(psin) {
+        Ok(parts) => {
+            let mut kinds = std::collections::BTreeMap::new();
+            for p in &parts { *kinds.entry(p.kind).or_insert(0usize) += 1; }
+            println!("part table: {} parts, by kind {kinds:?}", parts.len());
+            if list || part.is_some() {
+                for p in parts.iter().filter(|p| part.is_none_or(|id| id == p.id)) {
+                    println!("  part {:016x} kind {:>3} {:016x} {:016x}", p.id, p.kind, p.extra[0], p.extra[1]);
+                }
+            }
+        }
+        Err(e) => println!("part table: none ({e})"),
+    }
+    let vars = pedmeta::variations(psin)?;
+    println!("{} texture variation records", vars.len());
+    if list || part.is_some() || normal.is_some() {
+        for v in vars.iter().filter(|v| part.is_none_or(|id| id == v.part) && normal.is_none_or(|k| k == v.normal)) {
+            println!("  variation {:08x} part {:016x} diffuse {:016x} normal {:016x} {:016x}", v.variation, v.part, v.diffuse, v.normal, v.extra);
+        }
+    }
     Ok(())
 }
 
 fn cmd_tree(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, max_depth: usize) -> Result<()> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     tree(&raw, &path.display().to_string(), crypto, max_depth, 0)
 }
 
@@ -1101,8 +1254,9 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
             && f.ext.as_deref().is_none_or(|e| e.trim_start_matches('.') == ext)
             && f.magic.as_deref().is_none_or(|m| archive.head(entry, m.len()) == m);
         // Content is only inflated when needed: for grep or drawable, or to recurse.
-        let blocks = if (matches && (f.grep.is_some() || f.drawable)) || ext == "rpf" { archive.read_entry_blocks(entry).ok() } else { None };
-        let bytes = blocks.as_deref().map(<[Vec<u8>]>::concat);
+        // A nested archive is read in one piece (no block copy): the largest are several GB.
+        let blocks = if matches && ext != "rpf" && (f.grep.is_some() || f.drawable) { archive.read_entry_blocks(entry).ok() } else { None };
+        let bytes = if ext == "rpf" { archive.read_entry(entry).ok() } else { blocks.as_deref().map(<[Vec<u8>]>::concat) };
         let grep_ok = match (&f.grep, &bytes) {
             (None, _) => true,
             (Some(g), Some(b)) => !g.is_empty() && b.windows(g.len()).any(|w| w == g.as_slice()),
@@ -1114,9 +1268,14 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
                 .collect(),
             _ => Vec::new(),
         };
+        // The embedded drawable names, so a hit can be identified without exporting it.
+        let names = match bytes.as_deref().filter(|_| !lods.is_empty()).map(formats::drawable::labels).unwrap_or_default() {
+            l if l.len() <= 3 => l.iter().map(|n| format!("  {n}")).collect::<String>(),
+            l => format!("  {}, ... ({} drawables)", l[..3].join(", "), l.len()),
+        };
         if matches && grep_ok && (!f.drawable || !lods.is_empty()) {
             hits += 1;
-            println!("  {path:<24} {:#010x} {:>10} bytes .{ext}{}", entry.offset, entry.size, lods.concat());
+            println!("  {path:<24} {:#010x} {:>10} bytes .{ext}{}{names}", entry.offset, entry.size, lods.concat());
         }
         if ext == "rpf" {
             if let Some(b) = &bytes {
@@ -1130,6 +1289,22 @@ fn search(raw: &[u8], label: &str, crypto: &rpf9::crypto::CryptoContext, f: &Sea
     Ok(hits)
 }
 
+/// Bytes from a hex string; spaces are ignored.
+fn parse_hex(s: &str) -> Result<Vec<u8>> {
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    anyhow::ensure!(s.chars().all(|c| c.is_ascii_hexdigit()), "not a hex string: {s:?}");
+    anyhow::ensure!(!s.is_empty() && s.len() % 2 == 0, "hex string must have an even, nonzero number of digits");
+    Ok((0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect())
+}
+
+/// Read-only view of a file, memory-mapped so multi-GB archives are paged in on demand rather than read whole.
+/// Not for commands that may write the same path.
+fn map_file(path: &std::path::Path) -> Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: the mapping is read-only; forge9 never writes a file it has mapped.
+    unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mapping {}", path.display()))
+}
+
 /// Reads an entry by `index`, where `a/b/c` descends through nested RPF9s.
 fn load_entry(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<u8>> {
     Ok(load_entry_blocks(path, crypto, index)?.concat())
@@ -1137,7 +1312,7 @@ fn load_entry(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str)
 
 /// Like `load_entry`, keeping the final entry's inflated zlib blocks apart.
 fn load_entry_blocks(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: &str) -> Result<Vec<Vec<u8>>> {
-    entry_blocks(&std::fs::read(path)?, crypto, index)
+    entry_blocks(&map_file(path)?, crypto, index)
 }
 
 /// `load_entry_blocks` on archive bytes already in memory.
@@ -1354,9 +1529,56 @@ fn cmd_resource(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn cmd_object_graph(bytes: &[u8], tree: Option<String>, census: bool, json: bool) -> Result<()> {
+    let graph = formats::object_graph::ObjectGraph::parse(bytes)?;
+    if let Some(root_hex) = tree {
+        let root_id = u32::from_str_radix(root_hex.trim_start_matches("0x"), 16)
+            .with_context(|| format!("bad root_id hex: {root_hex:?}"))?;
+        match graph.dump_tree(root_id) {
+            Some(text) => print!("{text}"),
+            None => anyhow::bail!("no root with root_id {root_id:#x}"),
+        }
+        return Ok(());
+    }
+    let types = graph.type_census();
+    if census {
+        let mut sorted: Vec<_> = types.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        if json {
+            let map: serde_json::Map<String, serde_json::Value> = sorted.iter()
+                .map(|(h, c)| (format!("{h:#018x}"), serde_json::Value::from(*c))).collect();
+            println!("{}", serde_json::to_string_pretty(&map)?);
+        } else {
+            for (hash, count) in &sorted {
+                println!("  {hash:#018x}: {count}");
+            }
+            println!("{} distinct types, {} records", sorted.len(), graph.records.len());
+        }
+        return Ok(());
+    }
+    // Default: summary
+    let pointer_count: usize = graph.records.iter().map(|r| r.pointers.len()).sum();
+    if json {
+        let mut sorted: Vec<_> = types.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let top10: serde_json::Map<String, serde_json::Value> = sorted.iter().take(10)
+            .map(|(h, c)| (format!("{h:#018x}"), serde_json::Value::from(*c))).collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "records": graph.records.len(),
+            "roots": graph.root_indices.len(),
+            "pointers": pointer_count,
+            "distinct_types": sorted.len(),
+            "top_types": top10,
+        }))?);
+    } else {
+        print!("{}", graph.summary());
+    }
+    Ok(())
+}
+
 /// Key -> stored key from every EDUP entry at the top level of the archive at `path`.
 fn load_dedup(path: &std::path::Path, crypto: &rpf9::crypto::CryptoContext) -> Result<std::collections::HashMap<u64, u64>> {
-    let raw = std::fs::read(path)?;
+    let raw = map_file(path)?;
     let archive = rpf9::reader::Archive::open(&raw, crypto)?;
     let mut map = std::collections::HashMap::new();
     for e in archive.entries().iter().filter(|e| archive.head(e, 4) == b"EDUP") {
@@ -1385,11 +1607,18 @@ fn texture_location(stores: &[(String, formats::texture::LazyStore)], dedup: &st
 
 /// Exports the drawables of `parts` (entry index, blocks) as one scene.
 fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize, stores: &[PathBuf],
-    dedup: &std::collections::HashMap<u64, u64>, dict: &rpf9::hashes::Dict, materials_json: bool) -> Result<()> {
+    dedup: &std::collections::HashMap<u64, u64>, variations: &[formats::pedmeta::Variation], dict: &rpf9::hashes::Dict, materials_json: bool) -> Result<()> {
     use formats::{drawable, texture};
     let mut ds = parts.iter().map(|(i, b)| drawable::parse_blocks(b, lod).with_context(|| format!("entry {i}"))).collect::<Result<Vec<_>>>()?;
     let mut d = if ds.len() == 1 { ds.pop().unwrap() } else { drawable::merge(format!("{} entries", ds.len()), ds) };
     for s in &d.skipped { eprintln!("  skipped {s}"); }
+    for m in &mut d.materials {
+        if m.textures.iter().any(|t| t.param == drawable::DIFFUSE_PARAM) { continue; }
+        let Some(bump) = m.textures.iter().find(|t| t.param == drawable::BUMP_PARAM).map(|t| t.key) else { continue };
+        if let Some(v) = variations.iter().find(|v| v.normal == bump && v.diffuse != 0) {
+            m.textures.push(drawable::TextureRef { param: drawable::DIFFUSE_PARAM, name_hash: 0, key: v.diffuse });
+        }
+    }
     let mut opened = Vec::new();
     for path in stores {
         match texture::LazyStore::open(path) {
@@ -1446,9 +1675,15 @@ fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Optio
                         drawable::EMISSIVE_PARAM => Some(&mut m.emissive),
                         _ => None,
                     };
-                    let used = match slot.map(|slot| s.load(&tex).and_then(|()| texture::material_png(&s.store, &tex)).map(|png| *slot = Some(png))) {
+                    let normal = t.param == drawable::BUMP_PARAM;
+                    let png = |s: &mut texture::LazyStore| s.load(&tex).and_then(|()| match normal {
+                        true => texture::material_normal_png(&s.store, &tex),
+                        false => texture::material_png(&s.store, &tex).map(Some),
+                    });
+                    let used = match slot.map(|slot| png(s).map(|png| png.map(|png| *slot = Some(png)))) {
                         None => String::new(),
-                        Some(Ok(())) => ", embedded".into(),
+                        Some(Ok(Some(()))) => ", embedded".into(),
+                        Some(Ok(None)) => ", constant placeholder (no unit normal), not embedded".into(),
                         Some(Err(e)) => format!(", not decoded: {e:#}"),
                     };
                     let via = if tex.hash == t.key { String::new() } else { format!(" (dedup {:016x})", tex.hash) };
@@ -2178,6 +2413,15 @@ mod tests {
     fn sample(crypto: &CryptoContext, b: &[u8], level: u32) -> Vec<u8> {
         let nested = archive(crypto, &[b"alpha".to_vec(), b.to_vec()]);
         archive(crypto, &[b"<?xml version='1.0'?><a/>".to_vec(), nested, zlib(&[b'c'; 1000], level)])
+    }
+
+    #[test]
+    fn parses_hex_bytes() {
+        assert_eq!(parse_hex("24 54 85ff").unwrap(), vec![0x24, 0x54, 0x85, 0xff]);
+        assert!(parse_hex("245").is_err());
+        assert!(parse_hex("zz").is_err());
+        assert!(parse_hex("\u{e9}a").is_err());
+        assert!(parse_hex("").is_err());
     }
 
     #[test]

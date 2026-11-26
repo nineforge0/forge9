@@ -148,6 +148,26 @@ pub fn material_png(store: &Store, tex: &Texture) -> Result<Vec<u8>> {
     Ok(bcpack::ttpf::png_rgba(&px, tex.width, tex.height)?)
 }
 
+/// `material_png` for a normal map slot, or `None` for a constant placeholder that encodes no unit
+/// vector (e.g. the all-zero 4x4 `bumptex` many ped and prop shaders bind): embedded as a normal map
+/// it reads as (-1, -1, ~0) and renders black.
+pub fn material_normal_png(store: &Store, tex: &Texture) -> Result<Option<Vec<u8>>> {
+    let mut px = to_rgba(&mip0_blocks(store, tex, 0)?.0, tex);
+    let bc5 = matches!(tex.dxgi, 82..=84);
+    if placeholder_normal(&px, bc5) { return Ok(None); }
+    if bc5 { rebuild_z(&mut px); }
+    Ok(Some(bcpack::ttpf::png_rgba(&px, tex.width, tex.height)?))
+}
+
+/// Every texel identical and not a unit vector: x^2 + y^2 > 1 for a two-channel (BC5) map, a length
+/// outside 0.75..1.25 for an RGB one (channels as unorm8 mapped to -1..1).
+pub fn placeholder_normal(rgba: &[u8], two_channel: bool) -> bool {
+    let Some(first) = rgba.get(..4) else { return false };
+    if !rgba.chunks_exact(4).all(|p| p[..3] == first[..3]) { return false; }
+    let [x, y, z] = [first[0], first[1], first[2]].map(|c| f32::from(c) / 127.5 - 1.0);
+    if two_channel { x * x + y * y > 1.0 } else { !(0.75..=1.25).contains(&(x * x + y * y + z * z).sqrt()) }
+}
+
 fn rebuild_z(rgba: &mut [u8]) {
     for p in rgba.chunks_exact_mut(4) {
         let [x, y] = [p[0], p[1]].map(|c| f32::from(c) / 127.5 - 1.0);
@@ -319,6 +339,22 @@ fn dds_dx10(blocks: &[u8], w: u32, h: u32, dxgi: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_constant_placeholder_normals() {
+        let tile = |p: [u8; 4]| p.repeat(16);
+        // All-zero BC5 / BC1 placeholder: (-1, -1) is not on the unit disc, (-1, -1, -1) not unit length.
+        assert!(placeholder_normal(&tile([0, 0, 0, 255]), true));
+        assert!(placeholder_normal(&tile([0, 0, 0, 255]), false));
+        // A flat (0, 0, 1) normal is a real constant normal map, kept.
+        assert!(!placeholder_normal(&tile([128, 128, 255, 255]), false));
+        assert!(!placeholder_normal(&tile([128, 128, 0, 255]), true));
+        // Any variation is real data.
+        let mut v = tile([0, 0, 0, 255]);
+        v[4] = 9;
+        assert!(!placeholder_normal(&v, true));
+        assert!(!placeholder_normal(&[], true));
+    }
 
     fn put(d: &mut [u8], at: usize, v: u32) {
         d[at..at + 4].copy_from_slice(&v.to_le_bytes());

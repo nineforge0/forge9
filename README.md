@@ -41,6 +41,7 @@ reproduce, distribute or enable access to any protected work.
 - **Models**: export a drawable's LOD geometry (positions, indices, normals, up to two UV sets and the RGBA8 vertex attribute when present, plus one material per shader with its diffuse, normal and emissive textures embedded when they resolve in the `.ttpf` stores, directly or through the `EDUP` dedup table of `textures.rpf`, read lazily so multi-GB and partially downloaded stores work; several entries, e.g. the parts of a character, merge into one scene) to glTF 2.0 (`.glb`, or `.gltf` + `.bin`) or OBJ. Standalone drawables and drawable dictionaries; checked on a real drawable dictionary (see [docs/drawable_format.md](docs/drawable_format.md))
 - **Geometry checks**: dump a drawable's stored vertex, index and meshlet buffers with a reference JSON (layout, quantization, decoded positions, meshlets, AABBs), and check a position buffer captured from a run against it: NaN/Inf, `w <= 0`, outlying `x/w`, `y/w`, AABB and reference mismatches, on-screen triangle coverage (see [docs/geometry_check.md](docs/geometry_check.md))
 - **Mod packs**: TOML manifests of hash-guarded patches (text, XML, binary) to the user's own files, verified and applied in one command
+- **Large archives**: archives are memory-mapped, so multi-GB and nested archives are paged in as read
 - **Hexdump** individual entries for analysis
 - **JSON output** for integration with other tools
 - **Library crate**: every decoder is usable from Rust as `forge9::formats::*`
@@ -172,7 +173,7 @@ forge9 model props.rpf 12 --obj prop.obj --lod 1
 forge9 model props.rpf 12 --textures ttdb_props.ttpf   # texture stores (default: every .ttpf next to the archive)
 forge9 model packs.rpf 102/33 102/30 119/75 -o char.glb # several entries (character parts) in one scene
 forge9 model packs.rpf 102/33 --dedup textures.rpf      # EDUP table for deduplicated texture keys (default: textures.rpf next to the archive)
-forge9 search props.rpf --drawable              # every entry `model` can export, with mesh counts per LOD
+forge9 search props.rpf --drawable              # every entry `model` can export, with mesh counts per LOD and its names
 
 # Reference data for emulator testing: stored vertex/index/meshlet buffers + JSON per geometry, and a check of a
 # captured position buffer (stored, float3 or float4 clip) against it; see docs/geometry_check.md
@@ -187,6 +188,14 @@ forge9 texture store.ttpf --decode 12 -o a.png  # mip 0 as PNG (BC5 as red/green
 forge9 texture store.ttpf --decode 300 --slice 5 # one slice of an array texture
 forge9 bcpack-analyze store.ttpf --codec bc7     # BC3/BC5/BC7 entropy stage: fragments, lane stats
 forge9 bcpack-analyze store.ttpf 119 -o l.bin    # one chunk; lane symbol streams as u16 LE
+
+# Ped metadata PSIN: part table (one record per drawable of a character pack) and texture variation
+# records (part id, diffuse or region-map key, normal key); --normal finds a drawable's records by its bumptex key
+forge9 ped-meta packs.rpf 143
+forge9 ped-meta packs.rpf 5 --normal 7f3231727e17dcc5
+
+# Find raw bytes (e.g. a little-endian texture key) in every inflated entry, nested archives included
+forge9 search packs.rpf --grep-hex 245485440f247135
 
 # joaat hash of a name
 forge9 hash player_one
