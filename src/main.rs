@@ -1083,21 +1083,25 @@ fn cmd_psin(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext, index: usize, 
 
     // Check if it's a nested RPF9 containing PSIN
     if bytes.starts_with(b"9FPR") {
-        println!("entry #{index} is a nested RPF9: scanning for PSIN inside...");
+        eprintln!("entry #{index} is a nested RPF9: scanning for PSIN inside...");
         let nested = rpf9::reader::Archive::open(&bytes, crypto)?;
         let mut found = 0;
         for ne in nested.entries() {
             let nb = nested.read_entry(ne)?;
             if nb.starts_with(b"PSIN") {
                 found += 1;
-                println!("\n  nested entry #{} ({} bytes):", ne.index, nb.len());
                 let container = rpf9::psin::PsinContainer::parse(&nb)?;
-                rpf9::psin::print_summary(&container);
-                if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
-                if xml { rpf9::psin::print_dom(&container, dict); }
+                if !xml {
+                    println!("\n  nested entry #{} ({} bytes):", ne.index, nb.len());
+                    rpf9::psin::print_summary(&container);
+                    if show_structs { rpf9::psin::print_structs(&container, limit, dict); }
+                } else {
+                    rpf9::psin::print_dom(&container, dict);
+                }
             }
         }
-        if found == 0 { println!("  no PSIN entries in nested archive"); }
+        if found == 0 { eprintln!("  no PSIN entries in nested archive"); }
+        eprintln!("{found} PSIN entries processed");
         return Ok(());
     }
 
