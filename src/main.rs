@@ -546,14 +546,19 @@ fn main() -> Result<()> {
 
 fn cmd_info(path: &PathBuf, crypto: &rpf9::crypto::CryptoContext) -> Result<()> {
     let raw = map_file(path)?;
-    let archive = rpf9::reader::Archive::open(&raw, crypto)?;
-    let h = archive.header();
+    // Parse and print header before Archive::open so we see stride/flags even when open fails
+    let h = rpf9::header::Header::parse(&raw)?;
     println!("{} ({} bytes)", path.display(), raw.len());
-    println!("  version {}.{} gen {:#x} key #{}", h.version_high, h.version_low, h.generation(), archive.key_index());
+    println!("  version {}.{} gen {:#x}", h.version_high, h.version_low, h.generation());
     println!("  entries {} payload {:#x} split {:#x} trailer {:#x}", h.entry_count, h.payload_start, h.split, h.trailer_size);
-    println!("  key_id {:#x} flags {:#x} stride {}", h.key_id, h.flags, h.entry_stride());
-    let zlib = archive.entries().iter().filter(|e| e.is_zlib(&raw)).count();
-    println!("  {} entries ({} zlib, {} raw)", archive.entries().len(), zlib, archive.entries().len() - zlib);
+    println!("  key_id {:#x} flags {:#x} stride {} alignment {:#x}", h.key_id, h.flags, h.entry_stride(), h.alignment);
+    match rpf9::reader::Archive::open(&raw, crypto) {
+        Ok(archive) => {
+            let zlib = archive.entries().iter().filter(|e| e.is_zlib(&raw)).count();
+            println!("  {} entries recovered ({} zlib, {} raw) key #{}", archive.entries().len(), zlib, archive.entries().len() - zlib, archive.key_index());
+        }
+        Err(e) => eprintln!("  open failed: {e}"),
+    }
     Ok(())
 }
 

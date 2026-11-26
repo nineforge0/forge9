@@ -23,26 +23,36 @@ impl<'a> Archive<'a> {
         let declared = header.entry_count as usize;
         let archive_end = (data.len() as u64).saturating_sub(u64::from(header.trailer_size));
 
-        // The key whose plaintext holds the record table (24-byte, else compact) with the most entries.
-        let mut best: Option<(usize, usize, Vec<u8>, bool)> = None;
+        // The key whose plaintext holds the record table (24-byte/wide, else compact) with the most entries.
+        let mut best: Option<(usize, usize, usize, Vec<u8>, bool)> = None; // (run, start, stride, plain, compact)
         let mut best_key = 0;
+        let header_stride = header.entry_stride();
         for index in 0..crypto.key_count() {
             let schedule = crypto.schedule(index)?;
             let mut plain = ciphertext.to_vec();
             schedule.decrypt_cbc(&mut plain, &TAG_IV);
-            let found = entry::detect(&plain, end as u64, archive_end, declared).map(|(s, n)| (s, n, false))
-                .or_else(|| entry::detect_compact(&plain, data, end as u64).map(|(s, n)| (s, n, true)));
-            let Some((start, run, compact)) = found else { continue };
+            let found = entry::detect(&plain, end as u64, archive_end, declared).map(|(s, n, stride)| (s, n, stride, false))
+                .or_else(|| entry::detect_compact(&plain, data, end as u64).map(|(s, n)| (s, n, entry::RECORD, true)));
+            let Some((start, run, stride, compact)) = found else { continue };
             if best.as_ref().is_none_or(|(best_run, ..)| run > *best_run) {
-                best = Some((run, start, plain, compact));
+                best = Some((run, start, stride, plain, compact));
                 best_key = index;
             }
         }
-        let Some((run, start, plain, compact)) = best else {
+        let Some((run, start, stride, plain, compact)) = best else {
             if declared > 0 { bail!("no table records recovered with any key"); }
             return Ok(Self { data, header, entries: Vec::new(), key_index: 0 });
         };
-        let mut entries = if compact { entry::parse_compact(&plain, start, run) } else { entry::parse(&plain, start, run) };
+        if !compact && stride != header_stride {
+            eprintln!("rpf9: column stride {stride} != header stride {header_stride}");
+        }
+        let mut entries = if compact {
+            entry::parse_compact(&plain, start, run)
+        } else if stride > entry::RECORD {
+            entry::parse_wide(&plain, start, run, stride)
+        } else {
+            entry::parse(&plain, start, run)
+        };
         name(&mut entries, &entry::name_hashes(&plain, start, compact));
         Ok(Self { data, header, entries, key_index: best_key })
     }
