@@ -63,6 +63,17 @@ fn decode(bytes: &[u8]) -> Option<(u64, u32, u64, u64)> {
     (units != 0 && stored != 0).then(|| (u64::from(units) * 16, word(4), stored.saturating_mul(16), quad(16)))
 }
 
+/// Decodes a wide record (stride > 24, likely 32 bytes): `{u64 offset_units, u64 unknown, u64
+/// stored_units, u64 decoded}`. Lower 32 bits of the unknown field are treated as flags.
+/// ponytail: layout is hypothetical -- verify with actual levels.rpf data, adjust field positions
+fn decode_wide(bytes: &[u8], stride: usize) -> Option<(u64, u32, u64, u64)> {
+    if bytes.len() < stride || stride < 32 { return None; }
+    let quad = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    let (units, stored_units) = (quad(0), quad(16));
+    let flags = quad(8) as u32;
+    (units != 0 && stored_units != 0).then(|| (units * 16, flags, stored_units.saturating_mul(16), quad(24)))
+}
+
 /// Rewrites a record's location and sizes in place, keeping its flags.
 pub fn encode_location(record: &mut [u8], offset: u64, stored: u64, decoded: u64) {
     record[0..4].copy_from_slice(&((offset / 16) as u32).to_le_bytes());
@@ -70,20 +81,22 @@ pub fn encode_location(record: &mut [u8], offset: u64, stored: u64, decoded: u64
     record[16..24].copy_from_slice(&decoded.to_le_bytes());
 }
 
-/// Finds the 24-byte record table: the first 8-aligned start where `count` records in a row
-/// decode with payloads inside `data_start..end` that do not overlap and a decoded size under
-/// 4 GiB. `count` is the records
-/// column's own count when the column directory has it, else `declared`. Column data follows the
-/// directory, so the table starts no earlier than the last known descriptor's end plus the records
-/// column's offset from the shared base.
-pub fn detect(plain: &[u8], data_start: u64, end: u64, declared: usize) -> Option<(usize, usize)> {
-    let (count, rec_off) = column(plain, RECORDS).map_or((declared, 0), |(n, off, _)| (n, off));
+/// Finds the record table: the first 8-aligned start where `count` records in a row decode with
+/// payloads inside `data_start..end` that do not overlap and a decoded size under 4 GiB.
+/// Returns `(start, count, stride)` where stride comes from the column descriptor (falling back
+/// to `RECORD` = 24). Wide strides (e.g. 32 for >4 GiB archives) use `decode_wide`.
+pub fn detect(plain: &[u8], data_start: u64, end: u64, declared: usize) -> Option<(usize, usize, usize)> {
+    let (count, rec_off, col_stride) = column(plain, RECORDS)
+        .map_or((declared, 0, RECORD as u64), |(n, off, s)| (n, off, s));
+    let stride = if col_stride as usize >= RECORD { col_stride as usize } else { RECORD };
     if count == 0 { return None; }
     let dir_end = COLUMN_IDS.iter().filter_map(|id| plain.windows(8).position(|w| w == id.to_le_bytes())).max().map_or(0, |at| at + 24);
+    let wide = stride > RECORD;
     let valid = |s: usize| {
         let mut spans = Vec::with_capacity(count);
         for i in 0..count {
-            let (offset, _, stored, decoded) = decode(&plain[s + i * RECORD..])?;
+            let rec = &plain[s + i * stride..];
+            let (offset, _, stored, decoded) = if wide { decode_wide(rec, stride)? } else { decode(rec)? };
             // ponytail: a decoded size of 4 GiB or more is taken as a misaligned start (an
             // `offset | flags` word read as a size); lift it if an archive holds such an entry.
             if offset < data_start || offset.saturating_add(stored) > end || decoded >> 32 != 0 { return None; }
@@ -92,7 +105,7 @@ pub fn detect(plain: &[u8], data_start: u64, end: u64, declared: usize) -> Optio
         spans.sort_unstable();
         spans.windows(2).all(|w| w[0] == w[1] || w[0].0 + w[0].1 <= w[1].0).then_some(())
     };
-    ((dir_end + rec_off).next_multiple_of(8)..).step_by(8).take_while(|&s| s + count * RECORD <= plain.len()).find(|&s| valid(s).is_some()).map(|s| (s, count))
+    ((dir_end + rec_off).next_multiple_of(8)..).step_by(8).take_while(|&s| s + count * stride <= plain.len()).find(|&s| valid(s).is_some()).map(|s| (s, count, stride))
 }
 
 /// Directory hash of the 20-byte entry section that content archives (e.g. the
@@ -188,6 +201,22 @@ pub fn parse(plain: &[u8], table_at: usize, count: usize) -> Vec<Entry> {
         .collect()
 }
 
+/// Parses wide records (stride > 24) using `decode_wide`. The `raw` field stores the first 24
+/// bytes for compatibility; the full record width is handled internally.
+pub fn parse_wide(plain: &[u8], table_at: usize, count: usize, stride: usize) -> Vec<Entry> {
+    (0..count)
+        .filter_map(|index| {
+            let start = table_at + index * stride;
+            let slice = plain.get(start..start + stride)?;
+            let (offset, flags, size, decoded) = decode_wide(slice, stride)?;
+            let mut raw = [0u8; RECORD];
+            let copy_len = RECORD.min(slice.len());
+            raw[..copy_len].copy_from_slice(&slice[..copy_len]);
+            Some(Entry { index, offset, size, decoded_size: Some(decoded), size_hint: 0, aux: 0, flags, name_hash: None, raw })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,7 +229,7 @@ mod tests {
     fn records_carry_offset_stored_and_decoded_sizes() {
         // script.rpf: two raw nested RPF9s, flags 0, stored = decoded rounded up to 16
         let plain = [quads([0x100, 0xc2b9, 0xc2b90]), quads([0xc400, 0x3642b, 0x3642b0])].concat();
-        assert_eq!(detect(&plain, 0x260, 0x4282b0, 2), Some((0, 2)));
+        assert_eq!(detect(&plain, 0x260, 0x4282b0, 2), Some((0, 2, RECORD)));
         let entries = parse(&plain, 0, 2);
         assert_eq!((entries[0].offset, entries[0].size, entries[0].decoded_size), (0x1000, 0xc2b90, Some(0xc2b90)));
         assert_eq!((entries[1].offset, entries[1].size, entries[1].decoded_size), (0xc4000, 0x3642b0, Some(0x3642b0)));
@@ -217,7 +246,7 @@ mod tests {
         // declares 0x184d0 decoded bytes (a 64 KiB part and a 0x84d0 part) in 0x6390 stored.
         let flagged = |units: u64| units | 0xb00 << 32;
         let plain = words(&[0xd4, flagged(0x1200), 0x190, 0x2580, flagged(0x2300), 0x639, 0x184d0]);
-        assert_eq!(detect(&plain, 0x260, 0x30000, 2), Some((8, 2)));
+        assert_eq!(detect(&plain, 0x260, 0x30000, 2), Some((8, 2, RECORD)));
         let entries = parse(&plain, 8, 2);
         assert_eq!((entries[0].offset, entries[0].flags, entries[0].size, entries[0].decoded_size), (0x12000, 0xb00, 0x1900, Some(0x2580)));
         assert_eq!((entries[1].offset, entries[1].size, entries[1].decoded_size), (0x23000, 0x6390, Some(0x184d0)));
@@ -225,7 +254,7 @@ mod tests {
         // script.rpf/0: two words that decode as a record in bounds, but whose decoded size is
         // the real record's `offset | flags` word. The real table starts 16 bytes later.
         let plain = words(&[0x1000, 4, 0x5200 | 0x6000 << 32, 0x70b5, 0x293c30]);
-        assert_eq!(detect(&plain, 0x260, 0xc2b90, 1), Some((16, 1)));
+        assert_eq!(detect(&plain, 0x260, 0xc2b90, 1), Some((16, 1, RECORD)));
     }
 
     #[test]
