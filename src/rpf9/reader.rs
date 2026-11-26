@@ -152,6 +152,7 @@ pub fn sniff_ext(data: &[u8]) -> &'static str {
         _ if data.starts_with(b"KB2") => "bk2",
         _ if data.starts_with(b"DDS ") => "dds",
         _ if data.starts_with(b"\x89PNG") => "png",
+        _ if crate::formats::object_graph::looks_like(data) => "objg",
         _ => "bin",
     }
 }

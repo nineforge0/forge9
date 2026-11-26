@@ -6,6 +6,7 @@ pub mod bink;
 pub mod drawable;
 pub mod fssm;
 pub mod geometry_check;
+pub mod object_graph;
 pub mod pedmeta;
 pub mod ps09;
 pub mod rdna2;
