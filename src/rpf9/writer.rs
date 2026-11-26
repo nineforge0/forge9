@@ -181,11 +181,12 @@ pub fn repack_bytes(
     }
 
     // Rebuild 24-byte entry records in plaintext TOC; an unchanged entry keeps its decoded size.
-    let Some((entry_start, count)) = crate::rpf9::entry::detect(
+    let Some((entry_start, count, stride)) = crate::rpf9::entry::detect(
         &toc_plain, toc_end as u64, archive_end as u64, header.entry_count as usize,
-    ).filter(|&(_, n)| n == entries.len()) else {
-        bail!("TOC layout has no 24-byte entry records to rewrite (compact content archive?): repack unsupported");
+    ).filter(|&(_, n, s)| n == entries.len() && s == crate::rpf9::entry::RECORD) else {
+        bail!("TOC layout has no 24-byte entry records to rewrite (compact or wide-stride archive?): repack unsupported");
     };
+    let _ = stride;
     for (i, entry) in entries.iter().enumerate().take(count) {
         let decoded = match replacements.get(&entry.index) {
             Some(data) => crate::rpf9::reader::decode(data)?.len() as u64,

@@ -23,26 +23,30 @@ impl<'a> Archive<'a> {
         let declared = header.entry_count as usize;
         let archive_end = (data.len() as u64).saturating_sub(u64::from(header.trailer_size));
 
-        // The key whose plaintext holds the record table (24-byte, else compact) with the most entries.
-        let mut best: Option<(usize, usize, Vec<u8>, bool)> = None;
+        // The key whose plaintext holds the record table (24-byte/wide, else compact) with the most entries.
+        let mut best: Option<(usize, usize, usize, Vec<u8>, bool)> = None; // (run, start, stride, plain, compact)
         let mut best_key = 0;
         for index in 0..crypto.key_count() {
             let schedule = crypto.schedule(index)?;
             let mut plain = ciphertext.to_vec();
             schedule.decrypt_cbc(&mut plain, &TAG_IV);
-            let found = entry::detect(&plain, end as u64, archive_end, declared).map(|(s, n)| (s, n, false))
-                .or_else(|| entry::detect_compact(&plain, data, end as u64).map(|(s, n)| (s, n, true)));
-            let Some((start, run, compact)) = found else { continue };
+            let found = entry::detect(&plain, end as u64, archive_end, declared).map(|(s, n, stride)| (s, n, stride, false))
+                .or_else(|| entry::detect_compact(&plain, data, end as u64).map(|(s, n)| (s, n, entry::RECORD, true)));
+            let Some((start, run, stride, compact)) = found else { continue };
             if best.as_ref().is_none_or(|(best_run, ..)| run > *best_run) {
-                best = Some((run, start, plain, compact));
+                best = Some((run, start, stride, plain, compact));
                 best_key = index;
             }
         }
-        let Some((run, start, plain, compact)) = best else {
+        let Some((run, start, _stride, plain, compact)) = best else {
             if declared > 0 { bail!("no table records recovered with any key"); }
             return Ok(Self { data, header, entries: Vec::new(), key_index: 0 });
         };
-        let mut entries = if compact { entry::parse_compact(&plain, start, run) } else { entry::parse(&plain, start, run) };
+        let mut entries = if compact {
+            entry::parse_compact(&plain, start, run)
+        } else {
+            entry::parse(&plain, start, run)
+        };
         name(&mut entries, &entry::name_hashes(&plain, start, compact));
         Ok(Self { data, header, entries, key_index: best_key })
     }
@@ -89,7 +93,7 @@ impl<'a> Archive<'a> {
         // stored span; the declared decoded size counts every part.
         let blocks = inflate_zlib_chain(raw)?;
         let total: usize = blocks.iter().map(Vec::len).sum();
-        if let Some(d) = entry.decoded_size.filter(|&d| d != total as u64) {
+        if let Some(d) = entry.decoded_size.filter(|&d| (d as usize) < total) {
             bail!("entry #{} inflates to {total:#x} bytes in {} parts, but its record declares {d:#x}", entry.index, blocks.len());
         }
         Ok(blocks)
@@ -142,6 +146,7 @@ pub fn sniff_ext(data: &[u8]) -> &'static str {
         _ if data.starts_with(b"KB2") => "bk2",
         _ if data.starts_with(b"DDS ") => "dds",
         _ if data.starts_with(b"\x89PNG") => "png",
+        _ if crate::formats::object_graph::looks_like(data) => "objg",
         _ => "bin",
     }
 }

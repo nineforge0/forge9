@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Strip any AI co-authorship trailers from commit messages.
+# Belt-and-suspenders: Claude settings already disable attribution,
+# this catches anything that slips through.
+sed -i.bak '/^Co-Authored-By:.*[Cc]laude/d; /^Co-Authored-By:.*[Aa]nthrop/d; /^Co-Authored-By:.*noreply@anthropic/d' "$1"
+rm -f "$1.bak"
