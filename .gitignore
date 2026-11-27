@@ -8,6 +8,7 @@
 # Game data and crypto material: never committed
 /bin/
 /data/*.bin
+/data/extended.dict
 *.rpf
 *.ttpf
 *.bk2
