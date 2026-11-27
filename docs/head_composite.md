@@ -10,7 +10,9 @@ Checked on packs.rpf (Xbox v1.0.2.1); no mapping found.
   0x1a0130e1) and the shader hash 0x379efcef match none of the 591 distinct variation hashes; the
   shader hash (LE bytes `efcf9e37`) is in no entry of data.rpf, common.rpf or script.rpf.
 - `--grep head_fr1` finds nothing in data.rpf or common.rpf (names are not stored as strings).
-- levels.rpf still fails to open with all 22 keys ("no table records recovered"), so the
-  likeliest holder of head composite config stays unreadable.
+- levels.rpf now opens (2,078 entries, key #2, 0.7s) after the offset bit 32
+  fix (`8329918`), but it contains only world/map data: buildings, props,
+  terrain, NPC spawn schedules. Zero head textures, zero skin tones, zero
+  clothing palettes.
 Conclusion: head skin is composed at run time from the face library (`7`..`24`, `62`..`89`,
-`baseskintone` tags) or from data in unreadable archives; not decodable with current data.
+`baseskintone` tags) in packs.rpf; not from levels.rpf or any other currently decoded archive.

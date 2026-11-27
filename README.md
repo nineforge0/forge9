@@ -1,13 +1,22 @@
 # ![forge9](assets/forge9-banner.png)
 
-Forge9 is a Rust CLI and library for RPF9 archives and graphics diagnostics.
+**The most complete open-source RPF9 toolkit.** forge9 is the only tool that can decrypt, inspect, modify and **re-encrypt** RPF9 archives with byte-identical fidelity. It also ships the first open-source PSIN binary-XML decoder, an RDNA2 shader disassembler, a schema database harvester, and a full mod-pack system — 33 commands across 15,000 lines of Rust.
 
-- **Verify archive changes.** Inspect and extract entries, apply hash-guarded patches, and compare the inflated content after repacking. Offsets may change. [Repack validation](docs/repack_validation.md)
-- **Investigate a bad frame.** Match runtime shader IDs to the native program and check captured positions against reference geometry. Report frame timing from Windows or macOS. [Shader and frame diagnostics](docs/shader_compile_cost.md#match-a-runtime-report-to-a-shader) · [Geometry checks](docs/geometry_check.md)
-- **Preview exported assets.** Orbit a GLB model, inspect its meshes and materials, and open an exported texture in the browser. [Local asset viewer](viewer/README.md)
-- **Estimate texture payload budgets.** Compare the declared mip chain with the largest one, two, or three levels omitted. [Texture budget](docs/texture_budget.md)
+## What makes forge9 different
 
-[Try it without an archive or keys](#try-it-without-an-archive-or-keys) · [RPF9 format reference](docs/rpf9_format.md) · [Contributing](CONTRIBUTING.md)
+| Capability | forge9 | Others |
+|---|---|---|
+| **Full TOC re-encryption** | Byte-identical identity repacks, proven on every archive | Read-only or extract-only |
+| **PSIN binary-XML decoder** | DOM tree with typed attributes, struct/enum schemas, XML export | Not decoded |
+| **Schema database** | 6,710 struct and 1,132 enum definitions harvested across archives | — |
+| **Object graph parser** | 30,683 records, 483 roots, 67 types from the typed object forest | — |
+| **RDNA2 disassembler** | Full ISA decode, wave64 analysis, EXEC-uniformity, ray-traversal census | — |
+| **Mod packs** | Hash-guarded TOML patches: text, XML, binary ops with `--verify` | — |
+| **BCPack textures** | BC1/BC3/BC4/BC5/BC7 decode to DDS/PNG, including array slices | Partial BC1 |
+| **Model export** | glTF 2.0 / OBJ with embedded textures from `.ttpf` stores | Partial |
+| **Format documentation** | 17 technical documents with KNOWN/UNKNOWN separation | Scattered notes |
+
+[RPF9 format reference](docs/rpf9_format.md) · [All docs](docs/) · [Try without an archive](#try-it-without-an-archive-or-keys) · [Contributing](CONTRIBUTING.md)
 
 ## Scope and provenance
 
@@ -28,24 +37,6 @@ container format. It is documentation and code about a file format, nothing more
 The purpose is to understand and interoperate with a file format, not to
 reproduce, distribute or enable access to any protected work.
 
-## Features
-
-- **Decrypt** archive table-of-contents using a 9-key T-table cipher with CBC mode
-- **Inspect** headers, entry counts, key IDs, version info and flags
-- **List** all entries with offset, size, format detection (zlib, XML, PSIN, nested RPF9, etc.)
-- **Extract** entries to disk with automatic zlib chain inflation
-- **Tree / search** nested RPF9 archives by magic, extension, size or content
-- **Replace / repack** entries in place or at any size, re-encrypting the TOC
-- **Decode payloads**: AWC audio streams, SGD5 shader databases, Bink 2 video headers, PSIN game data, paged resources
-- **Textures**: list RDS5 (`.ttpf`) stores and decode BCPack BC1 to DDS or PNG (fitted endpoint tables; output is approximate, see [bcpack-rs#4](https://github.com/Ahmet-Dedeler/bcpack-rs/issues/4)), and BCPack BC3/BC4/BC5/BC7 to DDS (DX10) or PNG, including array slices (bcpack-rs `bc5-bc7` branch; checked against the stored mip pyramid on all 129 BC3/BC5/BC7 chunks we have)
-- **Models**: export a drawable's LOD geometry (positions, indices, normals, up to two UV sets and the RGBA8 vertex attribute when present, plus one material per shader with its diffuse, normal and emissive textures embedded when they resolve in the `.ttpf` stores, directly or through the `EDUP` dedup table of `textures.rpf`, read lazily so multi-GB and partially downloaded stores work; several entries, e.g. the parts of a character, merge into one scene) to glTF 2.0 (`.glb`, or `.gltf` + `.bin`) or OBJ. Standalone drawables and drawable dictionaries; checked on a real drawable dictionary (see [docs/drawable_format.md](docs/drawable_format.md))
-- **Geometry checks**: dump a drawable's stored vertex, index and meshlet buffers with a reference JSON (layout, quantization, decoded positions, meshlets, AABBs), and check a position buffer captured from a run against it: NaN/Inf, `w <= 0`, outlying `x/w`, `y/w`, AABB and reference mismatches, on-screen triangle coverage (see [docs/geometry_check.md](docs/geometry_check.md))
-- **Mod packs**: TOML manifests of hash-guarded patches (text, XML, binary) to the user's own files, verified and applied in one command
-- **Large archives**: archives are memory-mapped, so multi-GB and nested archives are paged in as read
-- **Hexdump** individual entries for analysis
-- **JSON output** for integration with other tools
-- **Library crate**: every decoder is usable from Rust as `forge9::formats::*`
-
 ## Install
 
 Check the [Releases page](https://github.com/nineforge0/forge9/releases) for prebuilt binaries. Download the asset for your platform and put it on your `PATH`.
@@ -56,9 +47,37 @@ Or build from source with a stable Rust toolchain:
 cargo install --git https://github.com/nineforge0/forge9
 ```
 
-### Try it without an archive or keys
+## Quick start
 
-Open a terminal in an empty directory. This example uses two small XML files you create:
+```bash
+# Archive overview
+forge9 info archive.rpf
+#   magic 9FPR  payload_start 0x1a98  entries 418  key_id 0x08
+#   version 0.4  generation 1  trailer 272 bytes
+
+# List entries with format detection
+forge9 list archive.rpf --recursive
+
+# Extract everything
+forge9 extract archive.rpf -o output/
+
+# Search across nested archives
+forge9 search archive.rpf --magic PSIN
+forge9 search packs.rpf --drawable          # every exportable model
+
+# PSIN game data: DOM tree as XML
+forge9 psin script.rpf 1/10 --xml > config.xml
+forge9 psin script.rpf 1 --structs         # struct/enum schemas
+
+# Export a character model with textures
+forge9 model packs.rpf 102/33 102/30 119/75 -o character.glb \
+  --textures store.ttpf --dedup textures.rpf
+
+# Modify and repack (re-encrypts the TOC)
+forge9 repack archive.rpf --patch 6=edited.xml -o modded.rpf --verify
+```
+
+### Try it without an archive or keys
 
 ```bash
 forge9 hash demo_marker
@@ -67,171 +86,151 @@ printf '%s\n' '<settings><speed value="2"/></settings>' > edited.xml
 forge9 mod make --path 0 original.xml edited.xml
 ```
 
-The last command prints a TOML patch with the original file's SHA-256 and the XML edit.
 For a graphics diagnostic you can reproduce with synthetic buffers, see the
 [geometry smoke test](docs/geometry_check.md#synthetic-smoke-test).
 
-From a source checkout, try the frame report with three synthetic intervals:
+## Command reference
+
+### Archive operations
+
+| Command | What it does |
+|---|---|
+| `info` | Header fields, entry count, key slot, version |
+| `list` | All entries with offset, size, format; `--recursive` for nested RPF9s; `--json` |
+| `stats` | Entries per kind, sizes, largest entries; `--top N` |
+| `diff` | Compare two archives by inflated payload; exit 1 if different |
+| `tree` | Recursive nested-archive tree |
+| `search` | Filter by magic, extension, size, content, `--grep-hex`, `--drawable` |
+| `catalog` | Full entry catalog with name recovery (dictionary + drawable labels + string candidates) |
+| `extract` | Entries to disk with automatic zlib inflation |
+| `hexdump` | Raw hex of a single entry |
+| `replace` | In-place same-size payload swap |
+| `repack` | Rebuild with replaced entries at any size, re-encrypted TOC; `--verify` |
+
+### Format decoders
+
+| Command | Format | Highlights |
+|---|---|---|
+| `psin` | PSIN / PSO v122 | Binary-XML DOM tree, struct/enum schemas, `--xml` export |
+| `object-graph` | Typed object forest | 67 types, root identification; `--census`, `--tree`, `--json` |
+| `schema-db` | Cross-archive schema | Harvest all struct/enum defs with dedup and counting |
+| `ped-meta` | Character metadata | Part table, texture variation records |
+| `awc` | AWC audio | Stream table: codec, channels, sample rate, chunks |
+| `shaders` | SGD5 shader DB | Record names, stages, tags, sizes |
+| `fssm` | Xbox shader programs | Root layout, used resources |
+| `isa` | RDNA2 machine code | Instruction families, wave64 ops, EXEC-uniformity, RT census |
+| `disasm` | RDNA2 disassembly | Full operand decode, LLVM-compatible syntax |
+| `pipelines` | PS09 pipeline cache | Graphics/compute PSOs, shader slots |
+| `bink` | Bink 2 video | Dimensions, frames, rate, duration |
+| `resource` | 0DRP paged resource | Kind detection, virtual/physical pointer resolution |
+| `model` | Drawables | glTF 2.0 / OBJ with textures; multiple entries merge into one scene |
+| `texture` | RDS5 (.ttpf) stores | List, decode BC1–BC7 to DDS/PNG, array slices, `--budget` |
+| `bcpack-analyze` | BCPack entropy | Fragment headers, lane symbol stats |
+
+### Modding
+
+| Command | What it does |
+|---|---|
+| `mod init` | Template `mod.toml` |
+| `mod make` | Generate patch ops from an original and edited file |
+| `mod verify` | Check every guard and op without writing |
+| `mod apply` | Repack with all patches; `--verify` reopens and checks |
+| `hash` | Compute joaat hash of a name |
+| `harvest` | Name unknown PSIN schema hashes from archive strings |
+
+Published mods: [forge9-mods](https://github.com/nineforge0/forge9-mods). Full spec: [docs/mod_format.md](docs/mod_format.md).
+
+## Detailed usage
+
+<details>
+<summary>Archive operations</summary>
 
 ```bash
-printf 'frame_ms\n16\n30\n50\n' | python3 scripts/frame_times.py -
-```
-
-The report shows a median frame interval of 30 ms and a p95 of 50 ms.
-
-## Usage
-
-```bash
-# Show archive info
 forge9 info archive.rpf
-
-# List entries
-forge9 list archive.rpf
 forge9 list archive.rpf --json
-forge9 list archive.rpf --recursive         # nested RPF9 entries too, as 5/3 paths
-
-# Summary: entries per kind, stored and inflated bytes, nested archives, largest entries
-forge9 stats archive.rpf --top 10
-forge9 stats archive.rpf --json
-
-# Compare two archives by inflated payload: added, removed, changed (with size delta) and
-# moved entries; exit code 0 if identical, 1 if they differ, 2 on error
-forge9 diff old.rpf new.rpf
-forge9 diff original.rpf repacked.rpf --json
-
-# Nested archives and searching
+forge9 list archive.rpf --recursive
+forge9 stats archive.rpf --top 10 --json
+forge9 diff old.rpf new.rpf --json
 forge9 tree archive.rpf --depth 2
 forge9 search archive.rpf --magic ADAT
-
-# Extract all entries
 forge9 extract archive.rpf -o output_dir
-
-# Extract specific entries
 forge9 extract archive.rpf --select 0,1,5
-
-# Hex dump entry #0
 forge9 hexdump archive.rpf 0 --limit 256
-
-# Rebuild with replaced entries (any size)
-forge9 repack archive.rpf --patch 6=new.xml -o repacked.rpf
-
-# Same, then reopen the output and check it: every replacement reads back, every other entry is
-# byte-identical (offsets may move); exits nonzero on any unexpected difference
 forge9 repack archive.rpf --patch 6=new.xml -o repacked.rpf --verify
 ```
 
-### Format decoders
+</details>
+
+<details>
+<summary>Format decoders</summary>
 
 Every decoder takes an archive and an entry index. Use `a/b` to reach an entry inside a nested RPF9
 (e.g. `5/3` is entry 3 of the archive stored as entry 5).
 
 ```bash
-# Audio streams: id, codec, channels, sample rate, sample count, chunks
+# Audio streams
 forge9 awc audio.rpf 12/0
 
-# Shader records: name, stage, record tag, compressed/decompressed size
+# Shader records and native programs
 forge9 shaders shaders.rpf 2
-forge9 shaders shaders.rpf 0 --summary     # counts per stage and tag
-
-# Root-signature layout of each native (FSSM) program: one line per program,
-# e.g. "MS <name>: 6 root params [Table(261 entries, s8, p0), ..., ResourceHeap(s15)]"
+forge9 shaders shaders.rpf 0 --summary
 forge9 fssm shaders.rpf 0 --roots
-forge9 fssm shaders.rpf 2 --shader 2       # full layout + used resources of one record
-forge9 fssm shaders.rpf 0                  # programs per stage
-forge9 fssm shaders.rpf 0 --json           # record and program IDs for matching runtime reports
+forge9 fssm shaders.rpf 0 --json
 
-# RDNA2 machine code of each FSSM program: instruction families and
-# wave64-sensitive ops (DPP, permlane, readlane, 64-bit EXEC/VCC masks, ...)
-forge9 isa shaders.rpf 2
-forge9 isa shaders.rpf 0 --summary         # programs using each op, by stage
-forge9 isa shaders.rpf 0 --shader 594      # full family breakdown of one record
-forge9 isa shaders.rpf 0 --opcodes         # opcode census (add --stage MS for one stage)
-forge9 isa shaders.rpf 0 --uniformity      # EXEC-uniform (guard-foldable) share, per stage and for the 30 heaviest
-forge9 isa shaders.rpf 0 --rt-census       # BVH intersect sites, traversal-loop shapes and loop share (--json too)
-forge9 isa shaders.rpf 0 --shader 594 --dump out  # raw code → out.<n>.<stage>.bin
-
-# Full disassembly of one record's programs, LLVM (llvm-mc -mcpu=gfx1030) syntax;
-# branch targets are byte offsets, unreached dwords print as `.long ... ; unreached`
+# RDNA2 machine code analysis
+forge9 isa shaders.rpf 0 --summary
+forge9 isa shaders.rpf 0 --opcodes
+forge9 isa shaders.rpf 0 --uniformity
+forge9 isa shaders.rpf 0 --rt-census
 forge9 disasm shaders.rpf 2 --shader 1
-forge9 disasm shaders.rpf 0 --shader 594 --raw   # with each instruction's dwords
 
-# Driver pipeline cache (PS09): graphics/compute PSOs and their shader slots
+# Pipeline cache
 forge9 pipelines shaders.rpf 1
-forge9 pipelines shaders.rpf 1 --mesh      # only PSOs with a mesh (NGG) shader
+forge9 pipelines shaders.rpf 1 --mesh
 
-# Bink 2 video: dimensions, frame count, frame rate, duration
-forge9 bink archive.rpf 3
+# PSIN game data
+forge9 psin script.rpf 1/10 --xml
+forge9 psin script.rpf 1 --structs
+forge9 object-graph script.rpf 0/0 --census --tree
 
-# PSIN game data and paged resources
-forge9 psin script.rpf 0 --structs
-forge9 resource archive.rpf 7
+# Schema database across archives
+forge9 schema-db script.rpf common.rpf
 
-# Drawable (model) geometry: LOD 0 by default; unhandled vertex formats are skipped and named
-forge9 model props.rpf 12 -o prop.glb          # binary glTF
-forge9 model props.rpf 12 -o prop.gltf         # glTF JSON + prop.bin
-forge9 model props.rpf 12 --obj prop.obj --lod 1
-forge9 model props.rpf 12 --textures ttdb_props.ttpf   # texture stores (default: every .ttpf next to the archive)
-forge9 model packs.rpf 102/33 102/30 119/75 -o char.glb # several entries (character parts) in one scene
-forge9 model packs.rpf 102/33 --dedup textures.rpf      # EDUP table for deduplicated texture keys (default: textures.rpf next to the archive)
-forge9 search props.rpf --drawable              # every entry `model` can export, with mesh counts per LOD and its names
-
-# Reference data for emulator testing: stored vertex/index/meshlet buffers + JSON per geometry, and a check of a
-# captured position buffer (stored, float3 or float4 clip) against it; see docs/geometry_check.md
+# Models with embedded textures
+forge9 model props.rpf 12 -o prop.glb
+forge9 model packs.rpf 102/33 102/30 119/75 -o char.glb
 forge9 model props.rpf 12 --dump-buffers dump
 forge9 check-positions dump/g0.json capture.bin --layout clip --stride 16
 
-# Texture stores (.ttpf files sit next to the archives, not inside them)
-forge9 texture store.ttpf                       # list: size, format, mips, tile mode, hash
-forge9 texture store.ttpf --budget              # nominal payload bytes for mip drops 0 through 3
-forge9 texture store.ttpf --extract 12 -o a.dds # BC1/BC3/BC4/BC5/BC7 mip 0 as DDS
-forge9 texture store.ttpf --decode 12 -o a.png  # mip 0 as PNG (BC5 as red/green)
-forge9 texture store.ttpf --decode 300 --slice 5 # one slice of an array texture
-forge9 bcpack-analyze store.ttpf --codec bc7     # BC3/BC5/BC7 entropy stage: fragments, lane stats
-forge9 bcpack-analyze store.ttpf 119 -o l.bin    # one chunk; lane symbol streams as u16 LE
+# Texture stores
+forge9 texture store.ttpf
+forge9 texture store.ttpf --budget
+forge9 texture store.ttpf --decode 12 -o a.png
+forge9 bcpack-analyze store.ttpf --codec bc7
 
-# Ped metadata PSIN: part table (one record per drawable of a character pack) and texture variation
-# records (part id, diffuse or region-map key, normal key); --normal finds a drawable's records by its bumptex key
+# Character metadata
 forge9 ped-meta packs.rpf 143
 forge9 ped-meta packs.rpf 5 --normal 7f3231727e17dcc5
 
-# Find raw bytes (e.g. a little-endian texture key) in every inflated entry, nested archives included
-forge9 search packs.rpf --grep-hex 245485440f247135
-
-# joaat hash of a name
+# Hash dictionary and name recovery
 forge9 hash player_one
-
-# Grow the hash dictionary: name unknown PSIN schema hashes from strings found in the archives
 forge9 harvest script.rpf common.rpf > names.txt
-forge9 --dict names.txt psin script.rpf 1 --structs
-
-# Entry catalog across archives (nested RPF9s included): one row per entry with its id
-# (`archive:path`, plus `@hash` when the TOC has a name hash for it), kind, stored and inflated size,
-# and its name: from the dictionary, else the embedded label of a drawable or drawable dictionary,
-# else candidate names from archive strings whose joaat matches (a 32-bit match can be a
-# coincidence), else unresolved. The name hash is the joaat of the entry name, read from
-# the TOC's u32 name hash column, a column beside the records rather than a record field; some
-# archives have no such column, or one shorter than their records.
 forge9 --dict names.txt catalog common.rpf script.rpf
-forge9 catalog common.rpf --write-dict recovered.txt                  # create a sorted dictionary of unique JOAAT matches
-forge9 --dict recovered.txt catalog script.rpf --write-dict recovered.txt  # reuse and add names
-forge9 catalog common.rpf --json             # array of {id, archive, path, hash, kind, stored, inflated, status, name, evidence, candidates}
+forge9 catalog common.rpf --write-dict recovered.txt --json
 ```
 
-Use a regular file for `--write-dict`. If a process is killed during an update, it may
-leave a `.forge9-tmp` file alongside the dictionary. Remove that staging file after
-checking that the original writer is no longer running.
+</details>
 
-### Mod packs
+<details>
+<summary>Mod packs</summary>
 
 Published mods live in [forge9-mods](https://github.com/nineforge0/forge9-mods).
 
 A mod is a `mod.toml` of **patches** applied to the user's own archive, so a published mod never
-contains game files. Each patch targets an entry by path (as `list --recursive` prints it), is
-guarded by the SHA-256 of the original inflated payload, and edits it with operations that check
-their own preconditions: exact text find/replace with a match count, XML element text or attribute
-set by path, and binary patch at an offset with the expected original bytes. Whole-file `file`
-replacement is for content the mod author created. Full spec: [docs/mod_format.md](docs/mod_format.md);
-example: [examples/xml-tweak](examples/xml-tweak).
+contains game files. Each patch targets an entry by path, is guarded by the SHA-256 of the original
+inflated payload, and edits with operations that check their own preconditions: exact text find/replace,
+XML element/attribute set by path, and binary patch at an offset with expected original bytes.
+Full spec: [docs/mod_format.md](docs/mod_format.md); example: [examples/xml-tweak](examples/xml-tweak).
 
 ```toml
 [mod]
@@ -251,105 +250,124 @@ value = "0.400000"
 ```
 
 ```bash
-forge9 mod init                          # write a template mod.toml
-forge9 mod verify mod.toml               # every guard and op checked, nothing written
-forge9 mod apply mod.toml -o modded.rpf  # repack the target with every patch
-forge9 mod apply mod.toml -o modded.rpf --verify  # then reopen it: patches present, nothing else changed
-forge9 diff common.rpf modded.rpf        # what changed
-forge9 mod make --path 9 original.xml edited.xml >> mod.toml   # ops from an edited extracted payload
+forge9 mod init
+forge9 mod verify mod.toml
+forge9 mod apply mod.toml -o modded.rpf --verify
+forge9 diff common.rpf modded.rpf
+forge9 mod make --path 9 original.xml edited.xml >> mod.toml
 ```
 
-`verify` and `apply` take `--archive path.rpf` to override `target_archive`, and refuse an archive whose
-entry does not match `base_sha256` (another game version, or already modded). v1 manifests
-(`[[replace]] entry = 6, file = ...`) still load as unguarded whole-file patches.
+</details>
 
 ## Supported formats
 
-Container spec: [docs/rpf9_format.md](docs/rpf9_format.md). Payload formats link their own documents below.
+Container spec: [docs/rpf9_format.md](docs/rpf9_format.md).
 
 | Format | Magic | Command | Status |
 |---|---|---|---|
-| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `catalog`, `extract`, `repack` | Read and write; TOC decrypt/encrypt; spec: [docs/rpf9_format.md](docs/rpf9_format.md) |
+| RPF9 archive | `9FPR` | `info`, `list`, `tree`, `stats`, `diff`, `catalog`, `extract`, `repack` | Read and write; TOC decrypt/encrypt |
 | zlib chains | `78 xx` | (automatic) | Inflated on read |
-| PSIN / PSO game data | `PSIN` | `psin`, `harvest` | Block table, struct schemas; schema hash names from archive strings |
-| AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM); no decode |
-| SGD5 shader database | `SGD5` | `shaders` | Record names, stages, tags, sizes; DXBC payload offsets |
-| Xbox shader program | `XBCH` → `FSSM` | `fssm` | XDAT section 0x0D inflated; stages, root layout, used resources |
-| RDNA2 machine code | (FSSM code range) | `isa`, `disasm` | Length decode by control flow, encoding families, opcodes, wave64-sensitive ops, EXEC-uniformity (DXIL-fold headroom), ray-traversal census; full disassembly with operands (matches llvm-mc on a 3.47M-instruction sample); see [docs/wave64_instruction_usage.md](docs/wave64_instruction_usage.md), [docs/rdna2_opcode_coverage.md](docs/rdna2_opcode_coverage.md), [docs/exec_uniformity.md](docs/exec_uniformity.md), [docs/rt_traversal_census.md](docs/rt_traversal_census.md) |
-| Pipeline cache | `PS 00 09` | `pipelines` | Header, graphics/compute PSO records, shader slots, metadata and code ranges |
+| PSIN / PSO game data | `PSIN` | `psin`, `harvest`, `schema-db` | DOM tree, struct/enum schemas, XML export |
+| Object graph | (typed forest) | `object-graph` | 67 types, 483 roots, census and tree dump |
+| AWC audio | `ADAT` | `awc` | Stream table, chunks, formats (Opus, XMA2, PCM) |
+| SGD5 shader database | `SGD5` | `shaders` | Record names, stages, tags, sizes |
+| Xbox shader program | `XBCH` → `FSSM` | `fssm` | Stages, root layout, used resources |
+| RDNA2 machine code | (FSSM) | `isa`, `disasm` | Full ISA decode, wave64 ops, EXEC-uniformity, RT census, disassembly |
+| Pipeline cache | `PS 00 09` | `pipelines` | Graphics/compute PSO records, shader slots |
 | Bink 2 video | `KB2?` | `bink` | Header: size, frames, dimensions, frame rate |
-| Paged resource | `0DRP` | `resource` | Kind detection, virtual/physical pointer resolution |
-| Drawable (model) | (paged, no magic) | `model` | Standalone drawables and drawable dictionaries: LOD groups → models → geometries; positions in formats 66 (quantized) and 99 (float3), octahedral 10:10 normals, two float2/snorm16 UV sets, clustered meshlet indices; to glTF/OBJ; shader group texture references resolved against `.ttpf` stores into glTF materials (key = store texture hash, confirmed on 30901 references). Tangents, skinning and fragments not yet decoded. Checked on a real drawable dictionary (format 66 path); the float3 path only on a synthetic drawable |
-| RDS5 texture store | `RDS5` | `texture` | Chunk table, ETPF index; mip 0 to DDS/PNG: BCPack BC1 (fitted tables, endpoints approximate), BCPack BC3/BC4/BC5/BC7 and plain BC3/BC4/BC5/BC7 (tile modes 0-3) |
-| XML, DDS, PNG, GFX, RBF | various | `list` | Detected only |
+| Paged resource | `0DRP` | `resource` | Kind detection, pointer resolution |
+| Drawable (model) | (paged) | `model` | LOD geometry to glTF/OBJ with textures from `.ttpf` stores |
+| RDS5 texture store | `RDS5` | `texture` | BC1/BC3/BC4/BC5/BC7 to DDS/PNG; array slices |
+
+## Documentation
+
+18 technical documents with KNOWN/UNKNOWN separation:
+
+| Document | Covers |
+|---|---|
+| [rpf9_format.md](docs/rpf9_format.md) | RPF9 container: header, encryption, TOC columns, records, compression |
+| [psin_format.md](docs/psin_format.md) | PSIN binary-XML: IFF chain, struct/enum schemas, block layout, DOM tree, pool refs |
+| [repack_validation.md](docs/repack_validation.md) | Byte-identical repacks, header signatures, loader analysis |
+| [mod_format.md](docs/mod_format.md) | Mod pack TOML spec |
+| [drawable_format.md](docs/drawable_format.md) | Paged resources and drawable geometry |
+| [geometry_check.md](docs/geometry_check.md) | Reference buffer dumps, captured position checks |
+| [key_families.md](docs/key_families.md) | Key schedule families and their archive assignments |
+| [material_id.md](docs/material_id.md) | Ped material-ID system |
+| [head_composite.md](docs/head_composite.md) | Head composite texture pipeline |
+| [bcpack_bc5_bc7_structure.md](docs/bcpack_bc5_bc7_structure.md) | BCPack BC5/BC7 stream structure |
+| [mesh_shader_binding_model.md](docs/mesh_shader_binding_model.md) | Mesh shader root parameter binding |
+| [wave64_instruction_usage.md](docs/wave64_instruction_usage.md) | Wave64-sensitive instructions |
+| [rdna2_opcode_coverage.md](docs/rdna2_opcode_coverage.md) | RDNA2 opcode coverage |
+| [exec_uniformity.md](docs/exec_uniformity.md) | EXEC uniformity of shader programs |
+| [shader_compile_cost.md](docs/shader_compile_cost.md) | Heaviest shader programs |
+| [rt_traversal_census.md](docs/rt_traversal_census.md) | Ray-traversal intersect sites |
+| [texture_budget.md](docs/texture_budget.md) | Texture VRAM budget from mip drops |
 
 ## Architecture
 
 ```
 src/
-  lib.rs            library root (`forge9` crate)
+  lib.rs            library root (forge9 crate)
   main.rs           CLI: one subcommand per cmd_* function
   rpf9/             the archive container
     header.rs       fixed header
     crypto.rs       T-table cipher, key schedules, CBC
-    entry.rs        TOC records (24-byte and compact layouts), name hash column
-    reader.rs       Archive::open with key discovery, entry reads, format sniffing
+    entry.rs        TOC records (24-byte and compact), name hash column
+    reader.rs       Archive::open with key discovery, entry reads
     writer.rs       in-place replace and full repack
-    psin.rs         PSIN / PSO data
+    psin.rs         PSIN / PSO binary-XML decoder
     hashes.rs       joaat and name dictionaries
   formats/          payload decoders (one file per format)
     awc.rs          AWC audio containers
     sgd5.rs         SGD5 shader databases
-    xbch.rs         DXBC → XDAT → XBCH unwrap (zlib → FSSM)
-    fssm.rs         FSSM programs: stages, root layout, used resources
-    rdna2.rs        RDNA2 (GFX10.3) instruction-length decoder and classifier
-    ps09.rs         PS09 driver pipeline cache
+    xbch.rs         DXBC → XDAT → XBCH unwrap
+    fssm.rs         FSSM programs: stages, root layout
+    rdna2.rs        RDNA2 instruction decoder and classifier
+    ps09.rs         PS09 pipeline cache
     bink.rs         Bink 2 video headers
-    drawable.rs     drawable geometry, glTF/OBJ writers
-    geometry_check.rs  reference buffer dumps, captured position checks
+    drawable.rs     drawable geometry, glTF/OBJ export
+    geometry_check.rs  reference buffers, position checks
     resource.rs     0DRP paged resources
     texture.rs      RDS5 texture stores (via bcpack-rs)
+    object_graph.rs typed object forest parser
   modding/          mod packs
     manifest.rs     mod.toml format
-    patch.rs        patch ops, XML value locator, `mod make`
+    patch.rs        patch ops, XML locator, mod make
     apply.rs        verify and apply against an archive
 ```
-
-Adding a format is one file in `src/formats/` plus a subcommand; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Crypto data
 
 The decryption tables and key schedules must be provided externally in a `data/` directory (or set via `--data-dir` / `FORGE9_DATA` env var):
 
 - `tables.bin` (20,480 bytes): 16 permuted S-boxes + 16 T-tables
-- `keys.bin` (39,060 bytes): 9 expanded key schedules
+- `keys.bin` (95,480 bytes): 22 expanded key schedules across 7 families
 
 These files are **not included** in this repository. They must be extracted from the target runtime by the user from their own legally obtained copy.
 
-## Legal
+## Roadmap
 
-This tool does not include, distribute or link to any game files, encryption keys, executables or copyrighted content. All crypto material and archive files must come from the user's own legally purchased copy of the game. This project exists for interoperability research and modding purposes, in the same spirit as tools like Wine, DXVK and Proton.
+- [x] Archive repacking with TOC re-encryption (byte-identical round trips)
+- [x] Nested RPF9 recursive inspection
+- [x] PSIN binary-XML decoder with DOM tree and schema database
+- [x] Object graph parser (typed pointer forest)
+- [x] Audio, shader and video container parsing
+- [x] RDNA2 disassembler with wave64 and ray-tracing analysis
+- [x] BCPack BC1/BC3/BC4/BC5/BC7 texture decoding
+- [x] Model export (glTF/OBJ) with embedded textures
+- [x] Pipeline cache (PS09) parsing
+- [x] Mod pack system with hash-guarded patches
+- [ ] PSIN binary-XML editor (read-modify-write)
+- [ ] Skinned/posed drawable export (skeleton binding)
+- [ ] Fragment resources (vehicles, complex props)
+- [ ] Full mip chains and cube maps (tile modes 9/10)
+- [ ] Name recovery from larger hash dictionaries
 
 ## Building
 
 ```bash
 cargo build --release
 ```
-
-## Roadmap
-
-- [x] Archive repacking (encrypt + rebuild TOC)
-- [x] Nested RPF9 recursive inspection
-- [x] Audio, shader and video container parsing
-- [x] Mod pack manifests
-- [ ] Name recovery from larger hash dictionaries
-- [ ] PSIN binary-XML editor (read-modify-write values)
-- [x] BCPack BC1 texture decoding
-- [x] BCPack BC3/BC5/BC7 texture decoding (mip 0, array slices)
-- [ ] Full mip chains and cube maps (tile modes 9/10)
-- [x] Model export (glTF/OBJ) from standalone drawables and drawable dictionaries (checked on a real dictionary)
-- [x] Pipeline cache (PS09) parsing and graphics/compute shader slot inspection
-- [ ] Streaming world analysis tools
 
 ## Contributing
 
@@ -363,6 +381,10 @@ and BC1 Gfx10 detiling come from
 [bcpack-rs](https://github.com/Ahmet-Dedeler/bcpack-rs) by Ahmet Dedeler (MIT OR Apache-2.0), whose
 rANS tables derive from Microsoft's MIT-licensed [silicon-rans](https://github.com/microsoft/silicon-rans).
 BC3/BC5/BC7 pixels for PNG output come from [bcdec_rs](https://crates.io/crates/bcdec_rs).
+
+## Legal
+
+This tool does not include, distribute or link to any game files, encryption keys, executables or copyrighted content. All crypto material and archive files must come from the user's own legally purchased copy of the game. This project exists for interoperability research and modding purposes, in the same spirit as tools like Wine, DXVK and Proton.
 
 ## License
 

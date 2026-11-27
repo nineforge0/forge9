@@ -22,7 +22,7 @@ All integers are little-endian. Offsets are file offsets unless stated.
 
 | Property | Value |
 |---|---|
-| File | `/Volumes/Extreme SSD/forge9-data/bin/game_scarlett_master.exe` (115 MB, PE32+ x64) |
+| File | Xbox v1.0.2.1 executable (115 MB, PE32+ x64) |
 | Table start | file offset `0x066e4940`, in `.rdata` |
 | Entry count | 22 key schedule blobs |
 | Blob size | `0x10F4` bytes (`KEY_BLOB_SIZE`); first 4 bytes are the family magic |

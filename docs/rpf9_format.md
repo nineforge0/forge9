@@ -114,10 +114,11 @@ It only matters for naming; forge9 needs only the tables.
 | `tables.bin` | `0x5000` (20,480) bytes | 16 input S-boxes (`0x100` each, at `0x0000`), then 16 T-tables (`0x400` each, at `0x1000`) | KNOWN |
 | `keys.bin` | `n * 0x10F4` bytes | One blob per key: 4-byte family magic `8E 9B 3B 4E`, 60 round-key words (`0xF0` bytes), 16 output S-boxes (`0x1000` bytes) | KNOWN |
 
-- The retail data uses **9 keys** (`keys.bin` = 39,060 bytes). The commit that
-  added content-archive support records that the executable holds exactly 9
-  blobs of the `8E9B3B4E` family, byte-identical to the ones forge9 uses; other
-  key-shaped blobs in it decrypt nothing.
+- The retail data uses **22 keys** in 7 families (`keys.bin` = 95,480 bytes).
+  The executable holds 22 blobs of `0x10F4` bytes starting with the family
+  magic `8E 9B 3B 4E`, at stride `0x1100` in `.rdata`. See
+  [key_families.md](key_families.md) for the family distribution and the
+  `key_id` mapping.
 - `CryptoContext::from_bytes` accepts any number of blobs, as long as each one
   starts with the family magic, so a wider keyring needs no code change.
 - **Provenance.** forge9 ships neither file and has no key material compiled
@@ -133,7 +134,7 @@ the longest run of valid records ([Record detection](#record-detection)). The
 header's `key_id` is not consulted. Observed slots (from
 [repack_validation.md](repack_validation.md)): slot 8 for `common.rpf`, slot 4
 for `appdata0.rpf` and `script.rpf`, slot 5 for `shaders.rpf`. Nested content
-archives decrypt with the same 9 keys.
+archives decrypt with the same 22 keys.
 
 `entry.rs` also defines a 16-byte marker, `GRAPH_MAGIC`: u64 `0x40` immediately
 followed by the records column id `0x33f70dfaf2c50989`. The repack validation
