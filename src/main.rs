@@ -300,6 +300,9 @@ enum Command {
         /// Report material bindings and texture-index matches without exporting a model
         #[arg(long, conflicts_with_all = ["output", "obj", "dump_buffers"])]
         materials_json: bool,
+        /// Force-bind a texture key to materials missing that parameter: `diffuse=HEXKEY`
+        #[arg(long, num_args = 1..)]
+        bind: Vec<String>,
     },
     /// Check a position buffer captured from a run against a `model --dump-buffers` reference JSON
     CheckPositions {
@@ -529,7 +532,7 @@ fn main() -> Result<()> {
         Command::Bink { archive, index } => cmd_bink(&load_entry(&archive, &crypto, &index)?),
         Command::Resource { archive, index } => cmd_resource(&load_entry(&archive, &crypto, &index)?),
         Command::ObjectGraph { archive, index, tree, census, json } => cmd_object_graph(&load_entry(&archive, &crypto, &index)?, tree, census, json),
-        Command::Model { archive, index, output, obj, lod, textures, dedup, ped_meta, dump_buffers, materials_json } => {
+        Command::Model { archive, index, output, obj, lod, textures, dedup, ped_meta, dump_buffers, materials_json, bind } => {
             let raw = map_file(&archive)?;
             let variations = match &ped_meta {
                 Some(i) => formats::pedmeta::variations(&entry_blocks(&raw, &crypto, i)?.concat())?,
@@ -555,7 +558,8 @@ fn main() -> Result<()> {
                 found.sort();
                 found
             };
-            cmd_model(&parts, output, obj, lod, &textures, &dedup, &variations, &dict, materials_json)
+            let bindings = parse_bindings(&bind)?;
+            cmd_model(&parts, output, obj, lod, &textures, &dedup, &variations, &dict, materials_json, &bindings)
         }
         Command::Mod(ModCommand::Apply { manifest, output, archive, verify }) => {
             let m = modding::manifest::Manifest::load(&manifest)?;
@@ -1594,6 +1598,22 @@ fn cmd_dump_buffers(d: &formats::drawable::Drawable, dir: &std::path::Path) -> R
     Ok(())
 }
 
+fn parse_bindings(args: &[String]) -> Result<Vec<(u32, u64)>> {
+    args.iter().map(|s| {
+        let (param, key) = s.split_once('=').with_context(|| format!("--bind expects PARAM=HEXKEY, got {s:?}"))?;
+        let param_hash = match param {
+            "diffuse" | "diffusetex" => formats::drawable::DIFFUSE_PARAM,
+            "bump" | "bumptex" | "normal" => formats::drawable::BUMP_PARAM,
+            "emissive" | "emissivetex" => formats::drawable::EMISSIVE_PARAM,
+            other => u32::from_str_radix(other.trim_start_matches("0x"), 16)
+                .with_context(|| format!("unknown param {other:?}: use diffuse/bump/emissive or a hex hash"))?,
+        };
+        let key = u64::from_str_radix(key.trim_start_matches("0x"), 16)
+            .with_context(|| format!("bad hex key {key:?}"))?;
+        Ok((param_hash, key))
+    }).collect()
+}
+
 fn texture_location(stores: &[(String, formats::texture::LazyStore)], dedup: &std::collections::HashMap<u64, u64>, key: u64) -> Option<(usize, usize)> {
     let find = |wanted| stores.iter().enumerate().find_map(|(store, (_, s))| {
         s.textures.iter().position(|t| t.hash == wanted).map(|texture| (store, texture))
@@ -1603,7 +1623,8 @@ fn texture_location(stores: &[(String, formats::texture::LazyStore)], dedup: &st
 
 /// Exports the drawables of `parts` (entry index, blocks) as one scene.
 fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Option<PathBuf>, lod: usize, stores: &[PathBuf],
-    dedup: &std::collections::HashMap<u64, u64>, variations: &[formats::pedmeta::Variation], dict: &rpf9::hashes::Dict, materials_json: bool) -> Result<()> {
+    dedup: &std::collections::HashMap<u64, u64>, variations: &[formats::pedmeta::Variation], dict: &rpf9::hashes::Dict,
+    materials_json: bool, bindings: &[(u32, u64)]) -> Result<()> {
     use formats::{drawable, texture};
     let mut ds = parts.iter().map(|(i, b)| drawable::parse_blocks(b, lod).with_context(|| format!("entry {i}"))).collect::<Result<Vec<_>>>()?;
     let mut d = if ds.len() == 1 { ds.pop().unwrap() } else { drawable::merge(format!("{} entries", ds.len()), ds) };
@@ -1613,6 +1634,13 @@ fn cmd_model(parts: &[(&str, Vec<Vec<u8>>)], output: Option<PathBuf>, obj: Optio
         let Some(bump) = m.textures.iter().find(|t| t.param == drawable::BUMP_PARAM).map(|t| t.key) else { continue };
         if let Some(v) = variations.iter().find(|v| v.normal == bump && v.diffuse != 0) {
             m.textures.push(drawable::TextureRef { param: drawable::DIFFUSE_PARAM, name_hash: 0, key: v.diffuse });
+        }
+    }
+    for m in &mut d.materials {
+        for &(param, key) in bindings {
+            if !m.textures.iter().any(|t| t.param == param) {
+                m.textures.push(drawable::TextureRef { param, name_hash: 0, key });
+            }
         }
     }
     let mut opened = Vec::new();
