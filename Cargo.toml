@@ -1,6 +1,6 @@
 [package]
 name = "forge9"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "General-purpose toolkit for RPF9 archives: read, decrypt, inspect, extract and analyze"
 license = "MIT"
